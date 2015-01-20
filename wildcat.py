@@ -71,8 +71,8 @@ class ipserverThread(threading.Thread):
 								print '[*] Connection from', self.addr
 							except:
 								print '[!] Connection error.'
+								self.error = True
 								self.running = False
-								self.s.close()
 				else:
 					inp, outp, excpt = select.select(self.input,[],[],0.0001)
 					if inp:
@@ -80,7 +80,9 @@ class ipserverThread(threading.Thread):
 							data, addr = self.s.recvfrom(16384)
 						elif self.proto == 'tcp':
 							data = self.c.recv(16384)
-						if data == '':
+						if len(data) == 0:
+							print '[!] Connection from', self.addr, 'lost.'
+							self.error = True
 							break
 						else:
 							self.oq.put(data)
