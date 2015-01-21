@@ -1,9 +1,10 @@
 #!/usr/bin/python
 
-import argparse, random, select, socket, struct, sys, threading, time, zlib
+import argparse, random, re, select, socket, struct, sys, threading, time, zlib
 from Queue import Queue
 
 ICMP_CODE = socket.getprotobyname('icmp')
+ICMP_PKT_SIZE = 512
 
 def tcpclient(host, port):
 	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -87,20 +88,18 @@ class ipserverThread(threading.Thread):
 		return header + msg
 
 	def send(self, msg):
-		if self.compression:
-			self.c.sendall(zlib.decompress(msg))
-		else:
-			if self.proto == 'icmp':
-				n = 512
-				msgs = [msg[i:i+n] for i in range(0, len(msg), n)]
+		if self.proto == 'icmp':
+			n = ICMP_PKT_SIZE
+			msgs = [msg[i:i+n] for i in range(0, len(msg), n)]
+			if not self.stateful:
 				for i in msgs:
-					packet = self.icmp_make(msg)
+					packet = self.icmp_make(i)
 					self.s.sendto(packet, (self.ip, 0))
-			else:
-				self.c.sendall(msg)
+		else:
+			self.c.sendall(msg)
 
 	def run(self):
-		if self.proto == 'udp' or self.proto == 'icmp':
+		if (self.proto == 'udp' or self.proto == 'icmp') and not self.stateful:
 			self.ready = True
 		if not self.openSocket():
 			self.error = True
@@ -109,20 +108,23 @@ class ipserverThread(threading.Thread):
 			self.c = self.s
 		while self.running:
 			if not self.error:
-				if self.proto == 'tcp' and not self.ready:
-					inp, outp, excpt = select.select([self.s],[],[],0.0001)
-					for x in inp:
-						if x == self.s:
-							try:
-								self.c, self.addr = self.s.accept()
-								self.ready = True
-								self.input = [self.c]
-								self.c.setblocking(0)
-								print '[*] Connection from', self.addr
-							except:
-								print '[!] Connection error.'
-								self.error = True
-								self.running = False
+				if not self.ready:
+					if self.proto == 'tcp':
+						inp, outp, excpt = select.select([self.s],[],[],0.0001)
+						for x in inp:
+							if x == self.s:
+								try:
+									self.c, self.addr = self.s.accept()
+									self.ready = True
+									self.input = [self.c]
+									self.c.setblocking(0)
+									print '[*] Connection from', self.addr
+								except:
+									print '[!] Connection error.'
+									self.error = True
+									self.running = False
+					elif self.proto == 'icmp':
+						print 'IMP'
 				else:
 					inp, outp, excpt = select.select(self.input,[],[],0.0001)
 					if inp:
@@ -179,27 +181,28 @@ def main():
 	compression = False
 	running = True
 	ready = False
-	bis = []
-	ins = []
-	outs = []
+	taps = []
+#	ins = []
+#	outs = []
 	threads = []
+	
+	args = ' '.join(sys.argv[1:])
+	args = re.split('\s*-u\s*', args)
+	args = filter(None, args)
+	argss = []
+	for i in args:
+		argss.append(re.split('\s*-o\s*', i))
 
-	p = argparse.ArgumentParser(description='WildCat')
-	p.add_argument('-c', dest='compress', action='store_true', help='Enable zlib compression.')
-	p.add_argument('-v', dest='verbose', action='store_true', help='Verbose mode.')
-	p.add_argument('-bi', dest='bis', default=[], action='append', help='Bi-directional data source.')
-	p.add_argument('-in', dest='ins', default=[], action='append', help='Input only data source.')
-	p.add_argument('-out', dest='outs', default=[], action='append', help='Output only data source.')
-	args = p.parse_args()
+	print argss
 
 	if len(sys.argv) == 1:
 		p.print_help()
 		sys.exit(1)
 
-	if args.compress:
-		compression = True
+	#if args.compress:
+	#	compression = True
 
-	for i in args.bis:
+	for i in args.taps:
 		if i == 'std':
 			print '[*] Starting stdin.'
 			t = stdThread(compression)
