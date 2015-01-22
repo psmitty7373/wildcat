@@ -18,6 +18,8 @@ GOT_SYN = 2
 WAIT_ACK = 3
 ACK_SENT = 4
 
+#sysctl -w net.ipv4.icmp_echo_ignore_all=1
+
 def tcpclient(host, port):
 	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 	s.connect((host,port))
@@ -36,6 +38,7 @@ class ipserverThread(threading.Thread):
 		self.port = port
 		self.proto = proto
 		self.server = False
+		self.serverid = 0
 		self.remote = remote
 		self.opts = opts
 		self.running = True
@@ -51,10 +54,12 @@ class ipserverThread(threading.Thread):
 		self.covert = False
 		self.lseq = 0
 		self.rseq = 0
-		if remote != '':
-			self.server = True
+		self.magic = 0
 		if proto == 'icmp':
 			self.magic = random.randint(0,255)
+		if remote != '':
+			self.server = True
+			self.serverid = self.magic
 		if opts.find('r') != -1:
 			self.stateful = True
 		self.recvthread = threading.Thread(target=self.recv)
@@ -101,10 +106,10 @@ class ipserverThread(threading.Thread):
 		answer = answer >> 8 | (answer << 8 & 0xff00)
 		return answer
 
-	def icmp_make(self, msg):
-		header = struct.pack('bbHHh', 8, 0, 0, self.magic, 1)
+	def icmp_make(self, msg, type):
+		header = struct.pack('bbHHh', type, 0, 0, self.serverid, 1)
 		cksum = self.icmp_cksum(header + msg)
-		header = struct.pack('bbHHh', 8, 0, socket.htons(cksum), self.magic, 1)
+		header = struct.pack('bbHHh', type, 0, socket.htons(cksum), self.serverid, 1)
 		return header + msg
 
 	def send(self, msg, flag=PSH, seq=-1):
@@ -120,12 +125,16 @@ class ipserverThread(threading.Thread):
 					if (flag == SACK and not self.ready) or flag == PSH:
 						self.state = WAIT_ACK
 					i = chr(self.magic) + chr(flag) + chr(seq) + i
-				packet = self.icmp_make(i)
+					if flag == SYN or flag == PSH or flag == FIN:
+						type = 8
+					else:
+						type = 0
+				packet = self.icmp_make(i, type)
 				self.s.sendto(packet, (self.remote, 0))
 				if (flag == PSH or flag == SYN or flag == FIN) and self.stateful: 
 					start_time = int(round(time.time() * 1000))
 					timeout = int(round(time.time() * 1000))
-					while self.state == WAIT_ACK or self.state == SYN_SENT and self.running:
+					while (self.state == WAIT_ACK or self.state == SYN_SENT) and self.running:
 						time.sleep(0.001)
 						curr_time = int(round(time.time() * 1000))
 						if curr_time - timeout > 30000:
@@ -163,20 +172,18 @@ class ipserverThread(threading.Thread):
 							if self.proto == 'icmp':
 								icmp_hdr = data[20:28]
 								type, code, chksum, id, seq = struct.unpack('bbHHh', icmp_hdr)
-								if id != self.magic and type == 8:
-									data = data[28:]
-								else:
-									continue
+								data = data[28:]
 								if self.stateful:
 									magic = ord(data[0])
 									flag = ord(data[1])
 									seq = ord(data[2])
 									data = data[3:]
 									#print 'M:',magic,'F:',flag,'S:',seq,'D:',data
-									if magic != self.magic and type == 8:
+									if magic != self.magic:
 										if flag == SYN and not self.ready:
 											self.remote = addr[0]
 											self.state = GOT_SYN
+											self.serverid = id
 										if flag == SACK and not self.ready:
 											if self.state == SYN_SENT:
 												self.state = IDLE
