@@ -5,18 +5,18 @@ from threading import Thread
 from Queue import Queue
 
 ICMP_CODE = socket.getprotobyname('icmp')
-ICMP_PKT_SIZE = 512
+ICMP_PKT_SIZE = 4
 SYN = 0
 ACK = 1
 SACK = 2
 PSH = 3
-EOF = 4
+FIN = 4
 
 IDLE = 0
 SYN_SENT = 1
-WAIT_ACK = 2
-ACK_SENT = 3
-
+GOT_SYN = 2
+WAIT_ACK = 3
+ACK_SENT = 4
 
 def tcpclient(host, port):
 	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -35,23 +35,30 @@ class ipserverThread(threading.Thread):
 		self.ip = ip
 		self.port = port
 		self.proto = proto
+		self.server = False
 		self.remote = remote
 		self.opts = opts
 		self.running = True
 		self.error = False
+		self.done = False
 		self.ready = False
 		self.s = None
 		self.c = None
 		self.addr = None
 		self.input = None
-		self.stateful = True
+		self.stateful = False
 		self.state = None
 		self.covert = False
 		self.lseq = 0
 		self.rseq = 0
+		if remote != '':
+			self.server = True
 		if proto == 'icmp':
 			self.magic = random.randint(0,255)
-		self.recvthread = Thread(target = self.recv)
+		if opts.find('r') != -1:
+			self.stateful = True
+		self.recvthread = threading.Thread(target=self.recv)
+		self.recvthread.daemon = True
 		self.recvthread.start()
 
 	def openSocket(self):
@@ -69,7 +76,6 @@ class ipserverThread(threading.Thread):
 				self.s.bind((self.ip,int(self.port)))
 			if self.proto == 'tcp':
 				self.s.listen(1)
-
 		except:
 			sys.stderr.write('[!] Unable to open socket.\n')
 			return False
@@ -108,22 +114,32 @@ class ipserverThread(threading.Thread):
 			n = ICMP_PKT_SIZE
 			msgs = [msg[i:i+n] for i in range(0, len(msg), n)]
 			if len(msgs) == 0:
-				print 'APPENDING'
 				msgs.append('')
 			for i in msgs:
-				if (flag == SACK and not self.ready) or flag == PSH:
-					self.state = WAIT_ACK
-				msg = chr(self.magic) + chr(flag) + chr(seq) + i
-				packet = self.icmp_make(msg)
+				if self.stateful:
+					if (flag == SACK and not self.ready) or flag == PSH:
+						self.state = WAIT_ACK
+					i = chr(self.magic) + chr(flag) + chr(seq) + i
+				packet = self.icmp_make(i)
 				self.s.sendto(packet, (self.remote, 0))
-				if flag == PSH:
-					while self.state == WAIT_ACK:
+				if (flag == PSH or flag == SYN or flag == FIN) and self.stateful: 
+					start_time = int(round(time.time() * 1000))
+					timeout = int(round(time.time() * 1000))
+					while self.state == WAIT_ACK or self.state == SYN_SENT and self.running:
 						time.sleep(0.001)
+						curr_time = int(round(time.time() * 1000))
+						if curr_time - timeout > 30000:
+							sys.stderr.write('[!] Connection timed out!\n')
+							self.error = True
+							return False
+						if curr_time - start_time > 2000:
+							self.s.sendto(packet, (self.remote, 0))
+							start_time = int(round(time.time() * 1000))
 		else:
 			self.c.sendall(msg)
 
 	def recv(self):
-		while self.running:
+		while self.running and not self.error:
 			if not self.ready and self.proto == 'tcp':
 				inp, outp, excpt = select.select([self.s],[],[],0.0001)
 				for x in inp:
@@ -140,8 +156,8 @@ class ipserverThread(threading.Thread):
 							self.running = False
 			else:
 				if self.input != None:	
-					inp, outp, excpt = select.select(self.input,[],[],0.0001)
-					if inp:
+					inp, outp, excpt = select.select(self.input,[],[],0)
+					while inp:
 						if self.proto == 'udp' or self.proto == 'icmp':
 							data, addr = self.s.recvfrom(16384)
 							if self.proto == 'icmp':
@@ -151,35 +167,38 @@ class ipserverThread(threading.Thread):
 									data = data[28:]
 								else:
 									continue
-								magic = ord(data[0])
-								flag = ord(data[1])
-								seq = ord(data[2])
-								data = data[3:]
-								#print 'M:',magic,'F:',flag,'S:',seq,'D:',data
-								if magic != self.magic and type == 8:
-									if flag == SYN and not self.ready:
-										self.remote = addr[0]
-										self.send('', SACK, 0)
-										self.state = WAIT_ACK
-									if flag == SACK and not self.ready:
-										if self.state == SYN_SENT:
-											self.state = IDLE
-											self.ready = True
-											self.send('', ACK, 0)
-											sys.stderr.write('[*] Connection to ' + self.remote + ' established.\n')
-									elif flag == ACK:
-										self.lseq += 1
-										if self.lseq > 254:
-											self.lseq = 0
-										if self.state == WAIT_ACK:
-											self.state = IDLE
-											if not self.ready:
+								if self.stateful:
+									magic = ord(data[0])
+									flag = ord(data[1])
+									seq = ord(data[2])
+									data = data[3:]
+									#print 'M:',magic,'F:',flag,'S:',seq,'D:',data
+									if magic != self.magic and type == 8:
+										if flag == SYN and not self.ready:
+											self.remote = addr[0]
+											self.state = GOT_SYN
+										if flag == SACK and not self.ready:
+											if self.state == SYN_SENT:
+												self.state = IDLE
 												self.ready = True
-												sys.stderr.write('[*] Connection from ' + addr[0] + '\n')
-									elif flag == PSH:
-										self.rseq = seq
-										self.send('', ACK, seq)
-									
+												self.send('', ACK, 0)
+												sys.stderr.write('[*] Connection to ' + self.remote + ' established.\n')
+										elif flag == ACK:
+											self.lseq += 1
+											if self.lseq > 254:
+												self.lseq = 0
+											if self.state == WAIT_ACK:
+												self.state = IDLE
+												if not self.ready:
+													self.ready = True
+													sys.stderr.write('[*] Connection from ' + addr[0] + '\n')
+										elif flag == PSH:
+											self.rseq = seq
+											self.send('', ACK, seq)
+										elif flag == FIN:
+											self.send('', ACK, seq)
+											sys.stderr.write('[*] Connection from ' + addr[0] + ' closed.\n')
+											self.error = True
 						elif self.proto == 'tcp':
 							data = self.c.recv(16384)
 						if self.proto == 'tcp' and len(data) == 0:
@@ -189,7 +208,9 @@ class ipserverThread(threading.Thread):
 						else:
 							if data != '':
 								self.oq.put(data)
-	
+						inp, outp, excpt = select.select(self.input,[],[],0)
+			time.sleep(0.1)
+
 	def run(self):
 		if (self.proto == 'udp' or self.proto == 'icmp') and not self.stateful:
 			self.ready = True
@@ -200,12 +221,18 @@ class ipserverThread(threading.Thread):
 			self.c = self.s
 		while self.running:
 			if not self.error:
-				#send
-				if not self.ready and self.proto == 'icmp':
+				if not self.ready and self.proto == 'icmp' and self.stateful:
 					if self.remote != '':
 						if self.state == None:
-							self.send('', SYN, 0)
 							self.state = SYN_SENT
+							self.send('', SYN, 0)
+					if self.state == GOT_SYN:
+						self.state == WAIT_ACK
+						self.send('', SACK, 0)
+			time.sleep(0.05)
+		if not self.error and self.stateful and self.ready:
+			self.state = WAIT_ACK
+			self.send('', FIN)
 		try:
 			self.s.close()
 			sefl.c.close()
@@ -217,6 +244,7 @@ class stdThread(threading.Thread):
 		threading.Thread.__init__(self)
 		self.running = True
 		self.error = False
+		self.done = False
 		self.oq = Queue(maxsize=0)
 		self.ready = True
 		self.opts = opts
@@ -224,13 +252,16 @@ class stdThread(threading.Thread):
 		sys.stdout.write(msg),
 		sys.stdout.flush()
 	def run(self):
-		input = [sys.stdin]
 		while self.running:
-			inp, outp, excpt = select.select(input,[],[], 0)
-			for x in inp:
-				if x == sys.stdin:
-					a = sys.stdin.readline()
-					self.oq.put(a)
+			if not self.error and not self.done:
+				while sys.stdin in select.select([sys.stdin],[],[], 0)[0]:
+					line = sys.stdin.readline()
+					if line:
+						self.oq.put(line)
+					else:
+						self.done = True
+						break
+			time.sleep(0.1)
 def help():
 	print '''usage: wildcat.py [-h] -u url [-o options]
 
@@ -242,6 +273,7 @@ arguments:
       e.g. tcp://127.0.0.1:8080 for a listener on the lo using tcp on port 8080
       e.g. icmp://0.0.0.0:0:192.168.1.1 for a client on all ints using icmp to 192.168.1.1
   -o  data source options in the form of a non-spaced string
+	r  "reliable" connection (only applies to UDP, ICMP, DNS, and NTP connections
 
 data source options:
 '''
@@ -299,6 +331,20 @@ def main():
 			running = False
 	try:
 		while len(threads) > 0 and running:
+			done = False
+			queuesempty = True
+			for t in threads:
+				if t.error == True:
+					t.running = False
+					running = False
+				if not t.oq.empty():
+					queuesempty = False
+				if t.done == True:
+					done = True
+
+			if done and queuesempty:
+				running = False
+				
 			if not ready:
 				ready = True
 				for t in threads:
@@ -306,9 +352,6 @@ def main():
 						ready = False
 			else:
 				for t in threads:
-					if t.error == True:
-						t.running = False
-						running = False
 					while not t.oq.empty():
 						msg = t.oq.get()
 						name = t.name
