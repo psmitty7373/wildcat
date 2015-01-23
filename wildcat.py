@@ -7,7 +7,7 @@ from Queue import Queue
 HEART_BEAT_TIME = 5000
 RETRANSMIT_TIME = 1000
 NETWORK_TIMEOUT = 30000
-ICMP_PKT_SIZE = 512
+ICMP_PKT_SIZE = 10
 
 ICMP_CODE = socket.getprotobyname('icmp')
 SYN = 0
@@ -29,6 +29,11 @@ COMPRESS = 1
 DECOMPRESS = 2
 
 #sysctl -w net.ipv4.icmp_echo_ignore_all=1
+
+def spinning_cursor():
+    while True:
+        for cursor in '|/-\\':
+            yield cursor
 
 def tcpclient(host, port):
 	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -68,9 +73,8 @@ class ipserverThread(threading.Thread):
 		self.rseq = 0
 		self.magic = 0
 		self.lasthb = 0
-		if proto == 'icmp':
-			self.magic = random.randint(0,255)
-		if remote != '':
+		self.magic = random.randint(0,255)
+		if remote == '':
 			self.server = True
 			self.serverid = self.magic
 		if opts.find('r') != -1:
@@ -82,6 +86,7 @@ class ipserverThread(threading.Thread):
 		self.recvthread = threading.Thread(target=self.recv)
 		self.recvthread.daemon = True
 		self.recvthread.start()
+		print self.port
 
 	def openSocket(self):
 		try:
@@ -94,7 +99,7 @@ class ipserverThread(threading.Thread):
 				self.s = socket.socket(socket.AF_INET,socket.SOCK_RAW, ICMP_CODE)
 			else:
 				return False
-			if not self.proto == 'icmp':
+			if not self.proto == 'icmp' and self.server:
 				self.s.bind((self.ip,int(self.port)))
 			if self.proto == 'tcp':
 				self.s.listen(1)
@@ -130,9 +135,7 @@ class ipserverThread(threading.Thread):
 		return header + msg
 
 	def send(self, msg, flag=PSH, seq=-1, type=8):
-		if self.proto == 'icmp':
-			if seq == -1:
-				seq = self.lseq
+		if self.proto == 'icmp' or self.proto == 'udp':
 			if self.compress == COMPRESS and msg != '':
 				msg = zlib.compress(msg)
 			n = ICMP_PKT_SIZE
@@ -140,8 +143,8 @@ class ipserverThread(threading.Thread):
 			if len(msgs) == 0:
 				msgs.append('')
 			if self.stateful:
-				if flag == PSH:
-					if self.server:
+				if flag == PSH or flag == BEGSTREAM or flag == ENDSTREAM:
+					if not self.server:
 						self.state = WAIT_ACK
 					else:
 						self.state = WAIT_HB
@@ -150,6 +153,8 @@ class ipserverThread(threading.Thread):
 				self.send('', BEGSTREAM, 0)
 			for i in msgs:
 				if self.stateful:
+					if flag != ACK:
+						seq = self.lseq;
 					successful = False
 					while not successful:
 						curr_time = int(round(time.time() * 1000))
@@ -161,12 +166,15 @@ class ipserverThread(threading.Thread):
 								sys.stderr.write('[!] Connection timed out!\n')
 								self.error = True
 								return False
-						packet = self.icmp_make(i, type)
-						self.s.sendto(packet, (self.remote, 0))
+						if self.proto == 'icmp':
+							packet = self.icmp_make(i, type)
+						else:
+							packet = i
+						self.s.sendto(packet, (self.remote))
 						if flag != ACK:
 							self.state = WAIT_ACK
 						# Retransmission timer / WAIT_ACK handler
-						if flag == PSH or flag == SYN or flag == FIN or flag == HB: 
+						if flag != ACK: 
 							start_time = int(round(time.time() * 1000))
 							timeout = int(round(time.time() * 1000))
 							while (self.state == WAIT_ACK) and self.running:
@@ -180,12 +188,15 @@ class ipserverThread(threading.Thread):
 									if not self.server:
 											self.state = WAIT_HB
 											continue	
-									self.s.sendto(packet, (self.remote, 0))
+									self.s.sendto(packet, (self.remote))
 									start_time = int(round(time.time() * 1000))
 						successful = True
 				else:
-					packet = self.icmp_make(i, type)
-					self.s.sendto(packet, (self.remote, 0))
+					if self.proto == 'icmp':
+						packet = self.icmp_make(i, type)
+					else:
+						packet = i
+					self.s.sendto(packet, (self.remote))
 			if self.compress == COMPRESS and flag == PSH:
 				self.send('', ENDSTREAM, 0)
 		else:
@@ -213,53 +224,68 @@ class ipserverThread(threading.Thread):
 					while inp:
 						if self.proto == 'udp' or self.proto == 'icmp':
 							data, addr = self.s.recvfrom(16384)
-							if self.proto == 'icmp':
-								icmp_hdr = data[20:28]
-								type, code, chksum, id, seq = struct.unpack('bbHHh', icmp_hdr)
-								data = data[28:]
+							if self.proto == 'icmp' or self.proto == 'udp':
+								if self.proto == 'icmp':
+									icmp_hdr = data[20:28]
+									type, code, chksum, id, seq = struct.unpack('bbHHh', icmp_hdr)
+									data = data[28:]
 								if self.stateful:
 									magic = ord(data[0])
 									flag = ord(data[1])
 									seq = ord(data[2])
 									data = data[3:]
-									#print 'M:',magic,'F:',flag,'S:',seq,'D:',data
+									#sys.stderr.write('M:' + str(magic) + ' F:' + str(flag) + ' S:' + str(seq) + ' D:' + data + '\n')
 									if magic != self.magic:
 										self.lasthb = int(round(time.time() * 1000))
 										if flag == SYN and not self.ready:
-											self.remote = addr[0]
+											self.remote = addr
 											self.state = GOT_SYN
-											self.serverid = id
+											self.serverid = magic
 										if flag == SACK and not self.ready:
-											if self.state == WAIT_ACK:
+											if self.state == WAIT_ACK and seq == self.lseq:
+												#self.lseq += 1
 												self.state = IDLE
 												self.ready = True
 												self.send('', ACK, 0, 8)
-												sys.stderr.write('[*] Connection to ' + self.remote + ' established.\n')
+												sys.stderr.write('[*] Connection to ' + self.remote[0] + ' established.\n')
 										elif flag == ACK:
-											self.lseq += 1
-											if self.lseq > 254:
-												self.lseq = 0
-											if self.state == WAIT_ACK:
-												self.state = IDLE
-												if not self.ready:
-													self.ready = True
-													sys.stderr.write('[*] Connection from ' + addr[0] + '\n')
+											if seq == self.lseq:
+												if self.ready:
+													self.lseq += 1
+												if self.state == WAIT_ACK:
+													self.state = IDLE
+													if not self.ready:
+														self.ready = True
+														sys.stderr.write('[*] Connection from ' + addr[0] + '\n')
+											else:
+												print 'OUT OF SYNC'
 										elif flag == PSH:
-											self.rseq = seq
+											if seq != self.rseq:
+												print 'OUT OF SYNC2'
 											self.send('', ACK, seq, 0)
+											self.rseq += 1
 										elif flag == BEGSTREAM:
 											self.oqlocked = True
+											self.send('', ACK, seq, 0)
+											self.rseq += 1
 										elif flag == ENDSTREAM:
 											self.oqlocked = False
-										elif flag == FIN:
 											self.send('', ACK, seq, 0)
+											self.rseq += 1
+										elif flag == FIN:
 											sys.stderr.write('[*] Connection from ' + addr[0] + ' closed.\n')
 											self.error = True
+											self.send('', ACK, seq, 0)
 										elif flag == HB:
 											if self.state != WAIT_HB:
 												self.send('', ACK, seq, 0)
 											else:
 												self.state = GOT_HB
+											self.rseq += 1
+										if self.lseq > 254:
+											self.lseq = 0
+										if self.rseq > 254:
+											self.rseq = 0
 									else:
 										data = ''
 						elif self.proto == 'tcp':
@@ -284,15 +310,15 @@ class ipserverThread(threading.Thread):
 			self.c = self.s
 		while self.running:
 			if not self.error:
-				if not self.ready and self.proto == 'icmp' and self.stateful:
-					if self.server:
+				if not self.ready and (self.proto == 'icmp' or self.proto == 'udp') and self.stateful:
+					if not self.server:
 						if self.state == None:
 							self.send('', SYN, 0, 8)
 					if self.state == GOT_SYN:
 						self.send('', SACK, 0, 0)
-				elif self.ready and self.proto == 'icmp' and self.stateful:
+				elif self.ready and (self.proto == 'icmp' or self.proto == 'udp') and self.stateful:
 					curr_time = int(round(time.time() * 1000))
-					if self.server:
+					if not self.server:
 						if self.lasthb == 0:
 							self.lasthb = curr_time
 						else:
@@ -365,6 +391,7 @@ def main():
 	ready = False
 	taps = []
 	threads = []
+	spinner = spinning_cursor()
 	
 	if len(sys.argv) == 1:
 		help()
@@ -402,7 +429,7 @@ def main():
 			port = i[0].split(proto + '://')[1].split(':')[1]
 			remote = ''
 			if len(i[0].split(proto + '://')[1].split(':')) > 2:
-				remote = i[0].split(proto + '://')[1].split(':')[2]
+				remote = (i[0].split(proto + '://')[1].split(':')[2], int(port))
 			sys.stderr.write('[*] Starting socket on ' + proto + ' ' + ip + ':' + port + '\n')
 			t = ipserverThread(ip, port, proto, remote, opts)
 			t.start()
@@ -443,7 +470,10 @@ def main():
 								if t2.name != name:
 									t2.send(msg)
 				threads = [t for t in threads if t.isAlive()]
-			time.sleep(0.01)
+			#sys.stdout.write(spinner.next())
+			#sys.stdout.flush()
+			time.sleep(0.1)
+			#sys.stdout.write('\b')
 
 	except KeyboardInterrupt:
 		running = False
