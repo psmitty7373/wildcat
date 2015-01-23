@@ -4,19 +4,24 @@ import argparse, random, re, select, socket, struct, sys, threading, time, zlib
 from threading import Thread
 from Queue import Queue
 
+HEART_BEAT_TIME = 5000
+RETRANSMIT_TIME = 1000
+NETWORK_TIMEOUT = 30000
+ICMP_PKT_SIZE = 10
+
 ICMP_CODE = socket.getprotobyname('icmp')
-ICMP_PKT_SIZE = 4
 SYN = 0
 ACK = 1
 SACK = 2
 PSH = 3
 FIN = 4
+HB = 5
 
 IDLE = 0
-SYN_SENT = 1
-GOT_SYN = 2
-WAIT_ACK = 3
-ACK_SENT = 4
+GOT_SYN = 1
+WAIT_ACK = 2
+WAIT_HB = 3
+GOT_HB = 4
 
 #sysctl -w net.ipv4.icmp_echo_ignore_all=1
 
@@ -55,6 +60,7 @@ class ipserverThread(threading.Thread):
 		self.lseq = 0
 		self.rseq = 0
 		self.magic = 0
+		self.lasthb = 0
 		if proto == 'icmp':
 			self.magic = random.randint(0,255)
 		if remote != '':
@@ -112,7 +118,7 @@ class ipserverThread(threading.Thread):
 		header = struct.pack('bbHHh', type, 0, socket.htons(cksum), self.serverid, 1)
 		return header + msg
 
-	def send(self, msg, flag=PSH, seq=-1):
+	def send(self, msg, flag=PSH, seq=-1, type=8):
 		if self.proto == 'icmp':
 			if seq == -1:
 				seq = self.lseq
@@ -120,30 +126,51 @@ class ipserverThread(threading.Thread):
 			msgs = [msg[i:i+n] for i in range(0, len(msg), n)]
 			if len(msgs) == 0:
 				msgs.append('')
+			if self.stateful:
+				if flag == PSH:
+					if self.server:
+						self.state = WAIT_ACK
+					else:
+						self.state = WAIT_HB
+						type = 0
 			for i in msgs:
 				if self.stateful:
-					if (flag == SACK and not self.ready) or flag == PSH:
-						self.state = WAIT_ACK
-					i = chr(self.magic) + chr(flag) + chr(seq) + i
-					if flag == SYN or flag == PSH or flag == FIN:
-						type = 8
-					else:
-						type = 0
-				packet = self.icmp_make(i, type)
-				self.s.sendto(packet, (self.remote, 0))
-				if (flag == PSH or flag == SYN or flag == FIN) and self.stateful: 
-					start_time = int(round(time.time() * 1000))
-					timeout = int(round(time.time() * 1000))
-					while (self.state == WAIT_ACK or self.state == SYN_SENT) and self.running:
-						time.sleep(0.001)
+					successful = False
+					while not successful:
 						curr_time = int(round(time.time() * 1000))
-						if curr_time - timeout > 30000:
-							sys.stderr.write('[!] Connection timed out!\n')
-							self.error = True
-							return False
-						if curr_time - start_time > 2000:
-							self.s.sendto(packet, (self.remote, 0))
+						i = chr(self.magic) + chr(flag) + chr(seq) + i
+						while self.state == WAIT_HB:
+							time.sleep(0.001)
+							timeout = int(round(time.time() * 1000))
+							if curr_time - timeout > NETWORK_TIMEOUT:
+								sys.stderr.write('[!] Connection timed out!\n')
+								self.error = True
+								return False
+						packet = self.icmp_make(i, type)
+						self.s.sendto(packet, (self.remote, 0))
+						if flag != ACK:
+							self.state = WAIT_ACK
+						# Retransmission timer / WAIT_ACK handler
+						if flag == PSH or flag == SYN or flag == FIN or flag == HB: 
 							start_time = int(round(time.time() * 1000))
+							timeout = int(round(time.time() * 1000))
+							while (self.state == WAIT_ACK) and self.running:
+								time.sleep(0.001)
+								curr_time = int(round(time.time() * 1000))
+								if curr_time - timeout > NETWORK_TIMEOUT:
+									sys.stderr.write('[!] Connection timed out!\n')
+									self.error = True
+									return False
+								if curr_time - start_time > RETRANSMIT_TIME:
+									if not self.server:
+											self.state = WAIT_HB
+											continue	
+									self.s.sendto(packet, (self.remote, 0))
+									start_time = int(round(time.time() * 1000))
+						successful = True
+				else:
+					packet = self.icmp_make(i, type)
+					self.s.sendto(packet, (self.remote, 0))
 		else:
 			self.c.sendall(msg)
 
@@ -180,15 +207,16 @@ class ipserverThread(threading.Thread):
 									data = data[3:]
 									#print 'M:',magic,'F:',flag,'S:',seq,'D:',data
 									if magic != self.magic:
+										self.lasthb = int(round(time.time() * 1000))
 										if flag == SYN and not self.ready:
 											self.remote = addr[0]
 											self.state = GOT_SYN
 											self.serverid = id
 										if flag == SACK and not self.ready:
-											if self.state == SYN_SENT:
+											if self.state == WAIT_ACK:
 												self.state = IDLE
 												self.ready = True
-												self.send('', ACK, 0)
+												self.send('', ACK, 0, 8)
 												sys.stderr.write('[*] Connection to ' + self.remote + ' established.\n')
 										elif flag == ACK:
 											self.lseq += 1
@@ -201,11 +229,18 @@ class ipserverThread(threading.Thread):
 													sys.stderr.write('[*] Connection from ' + addr[0] + '\n')
 										elif flag == PSH:
 											self.rseq = seq
-											self.send('', ACK, seq)
+											self.send('', ACK, seq, 0)
 										elif flag == FIN:
-											self.send('', ACK, seq)
+											self.send('', ACK, seq, 0)
 											sys.stderr.write('[*] Connection from ' + addr[0] + ' closed.\n')
 											self.error = True
+										elif flag == HB:
+											if self.state != WAIT_HB:
+												self.send('', ACK, seq, 0)
+											else:
+												self.state = GOT_HB
+									else:
+										data = ''
 						elif self.proto == 'tcp':
 							data = self.c.recv(16384)
 						if self.proto == 'tcp' and len(data) == 0:
@@ -229,13 +264,21 @@ class ipserverThread(threading.Thread):
 		while self.running:
 			if not self.error:
 				if not self.ready and self.proto == 'icmp' and self.stateful:
-					if self.remote != '':
+					if self.server:
 						if self.state == None:
-							self.state = SYN_SENT
-							self.send('', SYN, 0)
+							self.send('', SYN, 0, 8)
 					if self.state == GOT_SYN:
-						self.state == WAIT_ACK
-						self.send('', SACK, 0)
+						self.send('', SACK, 0, 0)
+				elif self.ready and self.proto == 'icmp' and self.stateful:
+					curr_time = int(round(time.time() * 1000))
+					if self.server:
+						if self.lasthb == 0:
+							self.lasthb = curr_time
+						else:
+							if curr_time - self.lasthb > HEART_BEAT_TIME:
+								self.send('', HB, 0, 8)
+								self.lasthb = int(round(time.time() * 1000))
+								self.state = WAIT_ACK
 			time.sleep(0.05)
 		if not self.error and self.stateful and self.ready:
 			self.state = WAIT_ACK
