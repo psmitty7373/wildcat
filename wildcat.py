@@ -7,7 +7,7 @@ from Queue import Queue
 HEART_BEAT_TIME = 5000
 RETRANSMIT_TIME = 1000
 NETWORK_TIMEOUT = 30000
-ICMP_PKT_SIZE = 10
+ICMP_PKT_SIZE = 512
 
 ICMP_CODE = socket.getprotobyname('icmp')
 SYN = 0
@@ -16,12 +16,17 @@ SACK = 2
 PSH = 3
 FIN = 4
 HB = 5
+BEGSTREAM = 6
+ENDSTREAM = 7
 
 IDLE = 0
 GOT_SYN = 1
 WAIT_ACK = 2
 WAIT_HB = 3
 GOT_HB = 4
+
+COMPRESS = 1
+DECOMPRESS = 2
 
 #sysctl -w net.ipv4.icmp_echo_ignore_all=1
 
@@ -39,6 +44,7 @@ class ipserverThread(threading.Thread):
 	def __init__(self, ip, port, proto, remote, opts):
 		threading.Thread.__init__(self)
 		self.oq = Queue(maxsize=0)
+		self.oqlocked = False
 		self.ip = ip
 		self.port = port
 		self.proto = proto
@@ -57,6 +63,7 @@ class ipserverThread(threading.Thread):
 		self.stateful = False
 		self.state = None
 		self.covert = False
+		self.compress = None
 		self.lseq = 0
 		self.rseq = 0
 		self.magic = 0
@@ -68,6 +75,10 @@ class ipserverThread(threading.Thread):
 			self.serverid = self.magic
 		if opts.find('r') != -1:
 			self.stateful = True
+		if 'c' in opts:
+			self.compress = COMPRESS
+		if 'd' in opts:
+			self.compress = DECOMPRESS
 		self.recvthread = threading.Thread(target=self.recv)
 		self.recvthread.daemon = True
 		self.recvthread.start()
@@ -122,6 +133,8 @@ class ipserverThread(threading.Thread):
 		if self.proto == 'icmp':
 			if seq == -1:
 				seq = self.lseq
+			if self.compress == COMPRESS and msg != '':
+				msg = zlib.compress(msg)
 			n = ICMP_PKT_SIZE
 			msgs = [msg[i:i+n] for i in range(0, len(msg), n)]
 			if len(msgs) == 0:
@@ -133,6 +146,8 @@ class ipserverThread(threading.Thread):
 					else:
 						self.state = WAIT_HB
 						type = 0
+			if self.compress == COMPRESS and flag == PSH:
+				self.send('', BEGSTREAM, 0)
 			for i in msgs:
 				if self.stateful:
 					successful = False
@@ -171,6 +186,8 @@ class ipserverThread(threading.Thread):
 				else:
 					packet = self.icmp_make(i, type)
 					self.s.sendto(packet, (self.remote, 0))
+			if self.compress == COMPRESS and flag == PSH:
+				self.send('', ENDSTREAM, 0)
 		else:
 			self.c.sendall(msg)
 
@@ -230,6 +247,10 @@ class ipserverThread(threading.Thread):
 										elif flag == PSH:
 											self.rseq = seq
 											self.send('', ACK, seq, 0)
+										elif flag == BEGSTREAM:
+											self.oqlocked = True
+										elif flag == ENDSTREAM:
+											self.oqlocked = False
 										elif flag == FIN:
 											self.send('', ACK, seq, 0)
 											sys.stderr.write('[*] Connection from ' + addr[0] + ' closed.\n')
@@ -296,21 +317,31 @@ class stdThread(threading.Thread):
 		self.error = False
 		self.done = False
 		self.oq = Queue(maxsize=0)
+		self.oqlocked = False
 		self.ready = True
 		self.opts = opts
+		self.compress = None
+		if 'd' in opts:
+			self.compress = DECOMPRESS
 	def send(self, msg):
+		if self.compress == DECOMPRESS:
+			msg = zlib.decompress(msg)
 		sys.stdout.write(msg),
 		sys.stdout.flush()
 	def run(self):
 		while self.running:
 			if not self.error and not self.done:
+				msg = ''
 				while sys.stdin in select.select([sys.stdin],[],[], 0)[0]:
+
 					line = sys.stdin.readline()
 					if line:
-						self.oq.put(line)
+						msg = msg + line
 					else:
 						self.done = True
 						break
+				if msg != '':
+					self.oq.put(msg)
 			time.sleep(0.1)
 def help():
 	print '''usage: wildcat.py [-h] -u url [-o options]
@@ -402,12 +433,15 @@ def main():
 						ready = False
 			else:
 				for t in threads:
-					while not t.oq.empty():
-						msg = t.oq.get()
-						name = t.name
-						for t2 in threads:
-							if t2.name != name:
-								t2.send(msg)
+					if not t.oqlocked and not t.oq.empty():
+						msg = ''
+						while not t.oq.empty():
+							msg += t.oq.get()
+							name = t.name
+						if msg != '':
+							for t2 in threads:
+								if t2.name != name:
+									t2.send(msg)
 				threads = [t for t in threads if t.isAlive()]
 			time.sleep(0.01)
 
