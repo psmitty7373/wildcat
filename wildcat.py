@@ -7,7 +7,8 @@ from Queue import Queue
 HEART_BEAT_TIME = 5000
 RETRANSMIT_TIME = 1000
 NETWORK_TIMEOUT = 30000
-ICMP_PKT_SIZE = 10
+MAX_PACKET_SIZE = 10
+DNS_LABEL_LEN = 63
 
 ICMP_CODE = socket.getprotobyname('icmp')
 SYN = 0
@@ -54,7 +55,7 @@ class ipserverThread(threading.Thread):
 		self.port = port
 		self.proto = proto
 		self.server = False
-		self.serverid = 0
+		self.serverid = 1337
 		self.remote = remote
 		self.opts = opts
 		self.running = True
@@ -76,7 +77,7 @@ class ipserverThread(threading.Thread):
 		self.magic = random.randint(0,255)
 		if remote == '':
 			self.server = True
-			self.serverid = self.magic
+			#self.serverid = self.magic
 		if opts.find('r') != -1:
 			self.stateful = True
 		if 'c' in opts:
@@ -86,13 +87,12 @@ class ipserverThread(threading.Thread):
 		self.recvthread = threading.Thread(target=self.recv)
 		self.recvthread.daemon = True
 		self.recvthread.start()
-		print self.port
 
 	def openSocket(self):
 		try:
 			if self.proto == 'tcp':
 				self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-			elif self.proto == 'udp':
+			elif self.proto == 'udp' or self.proto == 'dns':
 				self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 				self.s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
 			elif self.proto == 'icmp':
@@ -107,6 +107,7 @@ class ipserverThread(threading.Thread):
 			sys.stderr.write('[!] Unable to open socket.\n')
 			return False
 		sys.stderr.write('[*] Listening on port ' + str(self.port) + '\n')
+
 		return True
 
 	def icmp_cksum(self, msg):
@@ -114,8 +115,8 @@ class ipserverThread(threading.Thread):
 		count_to = (len(msg) / 2) * 2
 		count = 0
 		while count < count_to:
-			this_val = ord(msg[count + 1])*256+ord(msg[count])
-			sum = sum + this_val
+			i = ord(msg[count + 1])*256+ord(msg[count])
+			sum = sum + i
 			sum = sum & 0xffffffff
 			count = count + 2
 		if count_to < len(msg):
@@ -123,10 +124,37 @@ class ipserverThread(threading.Thread):
 			sum = sum & 0xffffffff
 		sum = (sum >> 16) + (sum & 0xffff)
 		sum = sum + (sum >> 16)
-		answer = ~sum
-		answer = answer & 0xffff
-		answer = answer >> 8 | (answer << 8 & 0xff00)
-		return answer
+		cksum = ~sum
+		cksum = cksum & 0xffff
+		cksum = cksum >> 8 | (cksum << 8 & 0xff00)
+		return cksum
+
+	def dns_q_make(self, msg, prevq=''):
+		#dns header
+		self.id = 0x1337
+		self.bits = 0x0100
+		self.qcount = 1
+		self.acount = 0
+		if prevq != '':
+			self.bits = 0x8180
+			self.acount = 1 
+		self.questions = []
+		msg = msg.encode('base64').replace('=','-').strip()
+		if len(msg) > 63:
+			a,b = msg[:len(msg)/2],msg[len(msg)/2:]
+			self.labels = [a,b,'chaumurky','com']
+		else:
+			self.labels = ['www','google','com']
+		binq = ''
+		for label in self.labels:
+			binq += struct.pack('B', len(label))
+			binq += label
+		binq += '\0'
+		binq += struct.pack('!HH', 16, 1)
+		self.questions.append(binq)
+		binpckt = struct.pack('!HHHHHH', self.id, self.bits, self.qcount, 0, 0, 0)
+		binpckt += binq
+		return binpckt
 
 	def icmp_make(self, msg, type):
 		header = struct.pack('bbHHh', type, 0, 0, self.serverid, 1)
@@ -135,10 +163,12 @@ class ipserverThread(threading.Thread):
 		return header + msg
 
 	def send(self, msg, flag=PSH, seq=-1, type=8):
-		if self.proto == 'icmp' or self.proto == 'udp':
+		if self.proto == 'icmp' or self.proto == 'udp' or self.proto == 'dns':
 			if self.compress == COMPRESS and msg != '':
 				msg = zlib.compress(msg)
-			n = ICMP_PKT_SIZE
+			n = MAX_PACKET_SIZE
+			if self.proto == 'dns':
+				n = DNS_LABEL_LEN
 			msgs = [msg[i:i+n] for i in range(0, len(msg), n)]
 			if len(msgs) == 0:
 				msgs.append('')
@@ -168,6 +198,9 @@ class ipserverThread(threading.Thread):
 								return False
 						if self.proto == 'icmp':
 							packet = self.icmp_make(i, type)
+						elif self.proto == 'dns':
+							print i
+							packet = self.dns_q_make(i)
 						else:
 							packet = i
 						self.s.sendto(packet, (self.remote))
@@ -194,6 +227,8 @@ class ipserverThread(threading.Thread):
 				else:
 					if self.proto == 'icmp':
 						packet = self.icmp_make(i, type)
+					elif self.proto == 'dns':
+						packet = self.dns_q_make(i)
 					else:
 						packet = i
 					self.s.sendto(packet, (self.remote))
@@ -222,72 +257,85 @@ class ipserverThread(threading.Thread):
 				if self.input != None:	
 					inp, outp, excpt = select.select(self.input,[],[],0)
 					while inp:
-						if self.proto == 'udp' or self.proto == 'icmp':
+						if self.proto == 'udp' or self.proto == 'icmp' or self.proto == 'dns':
 							data, addr = self.s.recvfrom(16384)
-							if self.proto == 'icmp' or self.proto == 'udp':
-								if self.proto == 'icmp':
-									icmp_hdr = data[20:28]
-									type, code, chksum, id, seq = struct.unpack('bbHHh', icmp_hdr)
-									data = data[28:]
-								if self.stateful:
-									magic = ord(data[0])
-									flag = ord(data[1])
-									seq = ord(data[2])
-									data = data[3:]
-									#sys.stderr.write('M:' + str(magic) + ' F:' + str(flag) + ' S:' + str(seq) + ' D:' + data + '\n')
-									if magic != self.magic:
-										self.lasthb = int(round(time.time() * 1000))
-										if flag == SYN and not self.ready:
-											self.remote = addr
-											self.state = GOT_SYN
-											self.serverid = magic
-										if flag == SACK and not self.ready:
-											if self.state == WAIT_ACK and seq == self.lseq:
-												#self.lseq += 1
+							if self.proto == 'icmp':
+								icmp_hdr = data[20:28]
+								type, code, chksum, id, seq = struct.unpack('bbHHh', icmp_hdr)
+								data = data[28:]
+							elif self.proto == 'dns':
+								dns_hdr = data[0:12]
+								id, bits, qcount, acount, ncount, rcount = struct.unpack('!HHHHHH', dns_hdr)
+								data = data[12:]
+								labels = []
+								while data[0] != '\x00':
+									qlen, = struct.unpack('!B', data[0])
+									label, = struct.unpack('!%ds' % qlen, data[1:qlen+1])
+									labels.append(label)
+									data = data[qlen+1:]
+								del labels[-2:]
+								data = ''
+								for i in labels:
+									data += i.replace('-','=').decode('base64')
+							if self.stateful and len(data) > 2:
+								magic = ord(data[0])
+								flag = ord(data[1])
+								seq = ord(data[2])
+								data = data[3:]
+								#sys.stderr.write('M:' + str(magic) + ' F:' + str(flag) + ' S:' + str(seq) + ' D:' + data + '\n')
+								if magic != self.magic:
+									self.lasthb = int(round(time.time() * 1000))
+									if flag == SYN and not self.ready:
+										self.remote = addr
+										self.state = GOT_SYN
+										#self.serverid = magic
+									if flag == SACK and not self.ready:
+										if self.state == WAIT_ACK and seq == self.lseq:
+											#self.lseq += 1
+											self.state = IDLE
+											self.ready = True
+											self.send('', ACK, 0, 8)
+											sys.stderr.write('[*] Connection to ' + self.remote[0] + ' established.\n')
+									elif flag == ACK:
+										if seq == self.lseq:
+											if self.ready:
+												self.lseq += 1
+											if self.state == WAIT_ACK:
 												self.state = IDLE
-												self.ready = True
-												self.send('', ACK, 0, 8)
-												sys.stderr.write('[*] Connection to ' + self.remote[0] + ' established.\n')
-										elif flag == ACK:
-											if seq == self.lseq:
-												if self.ready:
-													self.lseq += 1
-												if self.state == WAIT_ACK:
-													self.state = IDLE
-													if not self.ready:
-														self.ready = True
-														sys.stderr.write('[*] Connection from ' + addr[0] + '\n')
-											else:
-												print 'OUT OF SYNC'
-										elif flag == PSH:
-											if seq != self.rseq:
-												print 'OUT OF SYNC2'
+												if not self.ready:
+													self.ready = True
+													sys.stderr.write('[*] Connection from ' + addr[0] + '\n')
+										else:
+											print 'OUT OF SYNC'
+									elif flag == PSH:
+										if seq != self.rseq:
+											print 'OUT OF SYNC2'
+										self.send('', ACK, seq, 0)
+										self.rseq += 1
+									elif flag == BEGSTREAM:
+										self.oqlocked = True
+										self.send('', ACK, seq, 0)
+										self.rseq += 1
+									elif flag == ENDSTREAM:
+										self.oqlocked = False
+										self.send('', ACK, seq, 0)
+										self.rseq += 1
+									elif flag == FIN:
+										sys.stderr.write('[*] Connection from ' + addr[0] + ' closed.\n')
+										self.error = True
+										self.send('', ACK, seq, 0)
+									elif flag == HB:
+										if self.state != WAIT_HB:
 											self.send('', ACK, seq, 0)
-											self.rseq += 1
-										elif flag == BEGSTREAM:
-											self.oqlocked = True
-											self.send('', ACK, seq, 0)
-											self.rseq += 1
-										elif flag == ENDSTREAM:
-											self.oqlocked = False
-											self.send('', ACK, seq, 0)
-											self.rseq += 1
-										elif flag == FIN:
-											sys.stderr.write('[*] Connection from ' + addr[0] + ' closed.\n')
-											self.error = True
-											self.send('', ACK, seq, 0)
-										elif flag == HB:
-											if self.state != WAIT_HB:
-												self.send('', ACK, seq, 0)
-											else:
-												self.state = GOT_HB
-											self.rseq += 1
-										if self.lseq > 254:
-											self.lseq = 0
-										if self.rseq > 254:
-											self.rseq = 0
-									else:
-										data = ''
+										else:
+											self.state = GOT_HB
+										self.rseq += 1
+									if self.lseq > 254:
+										self.lseq = 0
+									if self.rseq > 254:
+										self.rseq = 0
+								else:
+									data = ''
 						elif self.proto == 'tcp':
 							data = self.c.recv(16384)
 						if self.proto == 'tcp' and len(data) == 0:
@@ -301,7 +349,7 @@ class ipserverThread(threading.Thread):
 			time.sleep(0.1)
 
 	def run(self):
-		if (self.proto == 'udp' or self.proto == 'icmp') and not self.stateful:
+		if (self.proto == 'udp' or self.proto == 'icmp' or self.proto == 'dns') and not self.stateful:
 			self.ready = True
 		if not self.openSocket():
 			self.error = True
@@ -310,13 +358,14 @@ class ipserverThread(threading.Thread):
 			self.c = self.s
 		while self.running:
 			if not self.error:
-				if not self.ready and (self.proto == 'icmp' or self.proto == 'udp') and self.stateful:
+				if not self.ready and (self.proto == 'icmp' or self.proto == 'udp' or self.proto == 'dns') and self.stateful:
 					if not self.server:
 						if self.state == None:
+							print 'SYN SENT'
 							self.send('', SYN, 0, 8)
 					if self.state == GOT_SYN:
 						self.send('', SACK, 0, 0)
-				elif self.ready and (self.proto == 'icmp' or self.proto == 'udp') and self.stateful:
+				elif self.ready and (self.proto == 'icmp' or self.proto == 'udp' or self.proto == 'dns') and self.stateful:
 					curr_time = int(round(time.time() * 1000))
 					if not self.server:
 						if self.lasthb == 0:
@@ -423,7 +472,7 @@ def main():
 			t = stdThread(opts)
 			threads.append(t)
 			t.start()
-		elif i[0][0:6] == 'tcp://' or i[0][0:6] == 'udp://' or i[0][0:7] == 'icmp://':
+		elif i[0][0:6] == 'tcp://' or i[0][0:6] == 'udp://' or i[0][0:7] == 'icmp://' or i[0][0:6] == 'dns://':
 			proto = i[0].split(':')[0]
 			ip = i[0].split(proto + '://')[1].split(':')[0]
 			port = i[0].split(proto + '://')[1].split(':')[1]
