@@ -74,7 +74,8 @@ class ipserverThread(threading.Thread):
 		self.rseq = 0
 		self.magic = 0
 		self.lasthb = 0
-		self.prevq = None
+		self.lastq = None
+		self.lastid = None
 		self.magic = random.randint(0,255)
 		if remote == '':
 			self.server = True
@@ -131,7 +132,10 @@ class ipserverThread(threading.Thread):
 		return cksum
 
 	def dns_make(self, msg):
-		self.id = 0x1337
+		if not self.server:
+			self.id = 0x1337
+		else:
+			self.id = self.lastid
 		self.bits = 0x0100
 		self.qcount = 1
 		self.acount = 0
@@ -153,7 +157,7 @@ class ipserverThread(threading.Thread):
 			binq += '\0'
 			binq += struct.pack('!HH', 16, 1)
 		else:
-			binq  = ' '.join(self.prevq)
+			binq  = ' '.join(self.lastq)
 			name = 49164
 			type = 16
 			cls = 1
@@ -297,6 +301,7 @@ class ipserverThread(threading.Thread):
 							elif self.proto == 'dns':
 								dns_hdr = data[0:12]
 								id, bits, qcount, acount, ncount, rcount = struct.unpack('!HHHHHH', dns_hdr)
+								self.lastid = id
 								data = data[12:]
 								questions = []
 								labels = []
@@ -311,7 +316,7 @@ class ipserverThread(threading.Thread):
 									type, cls = struct.unpack('!HH',data[1:5])
 									data = data[5:]
 									del labels[-2:]
-								self.prevq = questions
+								self.lastq = questions
 								for i in range(acount):
 									name, type, cls, ttl, dlen, tlen = struct.unpack('!HHHIHB', data[:13])
 									data = data[13:]
