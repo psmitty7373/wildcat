@@ -248,6 +248,8 @@ class ipserverThread(threading.Thread):
 										#TODO send error handling
 									start_time = int(round(time.time() * 1000))
 						successful = True
+						if flag == PSH:
+							self.lseq += 1
 				else:
 					if self.proto == 'icmp':
 						packet = self.icmp_make(i, type)
@@ -292,7 +294,7 @@ class ipserverThread(threading.Thread):
 					while inp:
 						if self.proto == 'udp' or self.proto == 'icmp' or self.proto == 'dns':
 							data, addr = self.s.recvfrom(16384)
-							if self.remote == '' or self.proto = 'dns':
+							if self.remote == '' or (self.proto == 'dns' and self.server):
 								self.remote = addr
 							if self.proto == 'icmp':
 								icmp_hdr = data[20:28]
@@ -331,7 +333,7 @@ class ipserverThread(threading.Thread):
 								flag = ord(data[1])
 								seq = ord(data[2])
 								data = data[3:]
-								#sys.stderr.write('M:' + str(magic) + ' F:' + str(flag) + ' S:' + str(seq) + ' D:' + data + '\n')
+								sys.stderr.write('M:' + str(magic) + ' F:' + str(flag) + ' RRS:' + str(seq) + ' TRS:' + str(self.rseq) + ' LS:' + str(self.lseq) + ' D:' + data + '\n')
 								if magic != self.magic:
 									self.lasthb = int(round(time.time() * 1000))
 									if flag == SYN and not self.ready:
@@ -340,16 +342,12 @@ class ipserverThread(threading.Thread):
 										#self.serverid = magic
 									if flag == SACK and not self.ready:
 										if self.state == WAIT_ACK and seq == self.lseq:
-											#self.lseq += 1
 											self.state = IDLE
 											self.ready = True
 											self.send('', ACK, 0, 8)
 											sys.stderr.write('[*] Connection to ' + self.remote[0] + ' established.\n')
 									elif flag == ACK:
-										print 'GOT ACK'
 										if seq == self.lseq:
-											if self.ready:
-												self.lseq += 1
 											if self.state == WAIT_ACK:
 												self.state = IDLE
 												if not self.ready:
@@ -370,6 +368,7 @@ class ipserverThread(threading.Thread):
 											print 'Old packet again...'
 										else:
 											print 'Packets from da future?!'
+											#TODO Request old packet again... semething has happened
 									elif flag == BEGSTREAM:
 										self.oqlocked = True
 										self.send('', ACK, seq, 0)
@@ -383,13 +382,11 @@ class ipserverThread(threading.Thread):
 										self.error = True
 										self.send('', ACK, seq, 0)
 									elif flag == HB:
-										print 'GOT HEARTBEAT'
 										if self.state != WAIT_HB:
 											
 											self.send('', ACK, seq, 0)
 										else:
 											self.state = GOT_HB
-										self.rseq += 1
 									if self.lseq > 254:
 										self.lseq = 0
 									if self.rseq > 254:
