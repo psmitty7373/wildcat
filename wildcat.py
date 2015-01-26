@@ -354,13 +354,21 @@ class ipserverThread(threading.Thread):
 												if not self.ready:
 													self.ready = True
 													sys.stderr.write('[*] Connection from ' + addr[0] + '\n')
-										else:
+										elif seq < self.lseq:
+											data = ''
 											print 'OUT OF SYNC'
+										else:
+											print 'something crazy'
 									elif flag == PSH:
-										if seq != self.rseq:
-											print 'OUT OF SYNC2'
-										self.send('', ACK, seq, 0)
-										self.rseq += 1
+										if seq == self.rseq:
+											self.send('', ACK, seq, 0)
+											self.rseq += 1
+										elif seq < self.rseq:
+											self.send('', ACK, seq, 0)
+											data = ''
+											print 'Old packet again...'
+										else:
+											print 'Packets from da future?!'
 									elif flag == BEGSTREAM:
 										self.oqlocked = True
 										self.send('', ACK, seq, 0)
