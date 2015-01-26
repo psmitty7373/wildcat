@@ -292,7 +292,7 @@ class ipserverThread(threading.Thread):
 					while inp:
 						if self.proto == 'udp' or self.proto == 'icmp' or self.proto == 'dns':
 							data, addr = self.s.recvfrom(16384)
-							if self.remote == '':
+							if self.remote == '' or self.proto = 'dns':
 								self.remote = addr
 							if self.proto == 'icmp':
 								icmp_hdr = data[20:28]
@@ -346,6 +346,7 @@ class ipserverThread(threading.Thread):
 											self.send('', ACK, 0, 8)
 											sys.stderr.write('[*] Connection to ' + self.remote[0] + ' established.\n')
 									elif flag == ACK:
+										print 'GOT ACK'
 										if seq == self.lseq:
 											if self.ready:
 												self.lseq += 1
@@ -382,7 +383,9 @@ class ipserverThread(threading.Thread):
 										self.error = True
 										self.send('', ACK, seq, 0)
 									elif flag == HB:
+										print 'GOT HEARTBEAT'
 										if self.state != WAIT_HB:
+											
 											self.send('', ACK, seq, 0)
 										else:
 											self.state = GOT_HB
