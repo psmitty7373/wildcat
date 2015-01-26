@@ -74,6 +74,7 @@ class ipserverThread(threading.Thread):
 		self.rseq = 0
 		self.magic = 0
 		self.lasthb = 0
+		self.prevq = None
 		self.magic = random.randint(0,255)
 		if remote == '':
 			self.server = True
@@ -86,7 +87,7 @@ class ipserverThread(threading.Thread):
 			self.compress = DECOMPRESS
 		self.recvthread = threading.Thread(target=self.recv)
 		self.recvthread.daemon = True
-		self.recvthread.start()
+
 
 	def openSocket(self):
 		try:
@@ -129,31 +130,41 @@ class ipserverThread(threading.Thread):
 		cksum = cksum >> 8 | (cksum << 8 & 0xff00)
 		return cksum
 
-	def dns_q_make(self, msg, prevq=''):
-		#dns header
+	def dns_make(self, msg):
 		self.id = 0x1337
 		self.bits = 0x0100
 		self.qcount = 1
 		self.acount = 0
-		if prevq != '':
+		if self.server:
 			self.bits = 0x8180
 			self.acount = 1 
-		self.questions = []
 		msg = msg.encode('base64').replace('=','-').strip()
-		if len(msg) > 63:
-			a,b = msg[:len(msg)/2],msg[len(msg)/2:]
-			self.labels = [a,b,'chaumurky','com']
-		else:
-			self.labels = ['www','google','com']
 		binq = ''
-		for label in self.labels:
-			binq += struct.pack('B', len(label))
-			binq += label
-		binq += '\0'
-		binq += struct.pack('!HH', 16, 1)
-		self.questions.append(binq)
-		binpckt = struct.pack('!HHHHHH', self.id, self.bits, self.qcount, 0, 0, 0)
-		binpckt += binq
+		bina = ''
+		if not self.server:
+			if len(msg) > 63:
+				a,b = msg[:len(msg)/2],msg[len(msg)/2:]
+				self.labels = [a,b,'chaumurky','com']
+			else:
+				self.labels = [msg,'chaumurky','com']
+			for label in self.labels:
+				binq += struct.pack('B', len(label))
+				binq += label
+			binq += '\0'
+			binq += struct.pack('!HH', 16, 1)
+		else:
+			binq  = ' '.join(self.prevq)
+			name = 49164
+			type = 16
+			cls = 1
+			ttl = 1
+			dlen = len(msg) + 1
+			tlen = len(msg)
+			bina = struct.pack('!HHHIHB',name, type, cls, ttl, dlen, tlen)
+			bina += msg
+		binpckt = struct.pack('!HHHHHH', self.id, self.bits, self.qcount, self.acount, 0, 0)
+		binpckt += binq + bina
+		
 		return binpckt
 
 	def icmp_make(self, msg, type):
@@ -199,11 +210,15 @@ class ipserverThread(threading.Thread):
 						if self.proto == 'icmp':
 							packet = self.icmp_make(i, type)
 						elif self.proto == 'dns':
-							print i
-							packet = self.dns_q_make(i)
+							packet = self.dns_make(i)
 						else:
 							packet = i
-						self.s.sendto(packet, (self.remote))
+						try:
+							self.s.sendto(packet, (self.remote))
+						except:
+							print 'ERROR1'
+							pass
+							#TODO send error handling
 						if flag != ACK:
 							self.state = WAIT_ACK
 						# Retransmission timer / WAIT_ACK handler
@@ -218,29 +233,43 @@ class ipserverThread(threading.Thread):
 									self.error = True
 									return False
 								if curr_time - start_time > RETRANSMIT_TIME:
-									if not self.server:
-											self.state = WAIT_HB
-											continue	
-									self.s.sendto(packet, (self.remote))
+									if self.server:
+										self.state = WAIT_HB
+										continue
+									try:
+										self.s.sendto(packet, (self.remote))
+									except:	
+										print 'ERROR2'
+										pass
+										#TODO send error handling
 									start_time = int(round(time.time() * 1000))
 						successful = True
 				else:
 					if self.proto == 'icmp':
 						packet = self.icmp_make(i, type)
 					elif self.proto == 'dns':
-						packet = self.dns_q_make(i)
+						packet = self.dns_make(i)
 					else:
 						packet = i
-					self.s.sendto(packet, (self.remote))
+					try:
+						self.s.sendto(packet, (self.remote))
+					except:	
+						pass
+						#TODO send error handling
 			if self.compress == COMPRESS and flag == PSH:
 				self.send('', ENDSTREAM, 0)
 		else:
-			self.c.sendall(msg)
+			try:
+				self.c.sendall(msg)
+			except:
+				print 'ERROR3'
+				pass
+				#TODO send error handling
 
 	def recv(self):
 		while self.running and not self.error:
 			if not self.ready and self.proto == 'tcp':
-				inp, outp, excpt = select.select([self.s],[],[],0.0001)
+				inp, outp, excpt = select.select([self.s],[],[],0)
 				for x in inp:
 					if x == self.s:
 						try:
@@ -259,6 +288,8 @@ class ipserverThread(threading.Thread):
 					while inp:
 						if self.proto == 'udp' or self.proto == 'icmp' or self.proto == 'dns':
 							data, addr = self.s.recvfrom(16384)
+							if self.remote == '':
+								self.remote = addr
 							if self.proto == 'icmp':
 								icmp_hdr = data[20:28]
 								type, code, chksum, id, seq = struct.unpack('bbHHh', icmp_hdr)
@@ -267,16 +298,29 @@ class ipserverThread(threading.Thread):
 								dns_hdr = data[0:12]
 								id, bits, qcount, acount, ncount, rcount = struct.unpack('!HHHHHH', dns_hdr)
 								data = data[12:]
+								questions = []
 								labels = []
-								while data[0] != '\x00':
-									qlen, = struct.unpack('!B', data[0])
-									label, = struct.unpack('!%ds' % qlen, data[1:qlen+1])
-									labels.append(label)
-									data = data[qlen+1:]
-								del labels[-2:]
-								data = ''
-								for i in labels:
-									data += i.replace('-','=').decode('base64')
+								for i in range(qcount):
+									nullbyte = data.find('\0')
+									questions.append(data[0:nullbyte+5])
+									while data[0] != '\0':
+										qlen, = struct.unpack('!B', data[0])
+										label, = struct.unpack('!%ds' % qlen, data[1:qlen+1])
+										labels.append(label)
+										data = data[qlen+1:]
+									type, cls = struct.unpack('!HH',data[1:5])
+									data = data[5:]
+									del labels[-2:]
+								self.prevq = questions
+								for i in range(acount):
+									name, type, cls, ttl, dlen, tlen = struct.unpack('!HHHIHB', data[:13])
+									data = data[13:]
+								if acount == 0:
+									data = ''
+									for i in labels:
+										data += i.replace('-','=').decode('base64')
+								else:
+									data = data.replace('-','=').decode('base64')
 							if self.stateful and len(data) > 2:
 								magic = ord(data[0])
 								flag = ord(data[1])
@@ -339,7 +383,7 @@ class ipserverThread(threading.Thread):
 						elif self.proto == 'tcp':
 							data = self.c.recv(16384)
 						if self.proto == 'tcp' and len(data) == 0:
-							sys.stderr.write('[!] Connection from ' + self.addr + ' lost.\n')
+							sys.stderr.write('[!] Connection from ' + self.addr[0] + ' lost.\n')
 							self.error = True
 							break
 						else:
@@ -356,12 +400,12 @@ class ipserverThread(threading.Thread):
 		else:
 			self.input = [self.s]
 			self.c = self.s
+			self.recvthread.start()
 		while self.running:
 			if not self.error:
 				if not self.ready and (self.proto == 'icmp' or self.proto == 'udp' or self.proto == 'dns') and self.stateful:
 					if not self.server:
 						if self.state == None:
-							print 'SYN SENT'
 							self.send('', SYN, 0, 8)
 					if self.state == GOT_SYN:
 						self.send('', SACK, 0, 0)
@@ -379,9 +423,11 @@ class ipserverThread(threading.Thread):
 		if not self.error and self.stateful and self.ready:
 			self.state = WAIT_ACK
 			self.send('', FIN)
+		self.recvthread.running = False
+		self.recvthread.join()
 		try:
 			self.s.close()
-			sefl.c.close()
+			self.c.close()
 		except:
 			pass
 
