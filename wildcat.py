@@ -55,7 +55,7 @@ class ipserverThread(threading.Thread):
 		self.port = port
 		self.proto = proto
 		self.server = False
-		self.serverid = 1337
+		self.remotemagic = None
 		self.remote = remote
 		self.opts = opts
 		self.running = True
@@ -68,18 +68,15 @@ class ipserverThread(threading.Thread):
 		self.input = None
 		self.stateful = False
 		self.state = None
-		self.covert = False
 		self.compress = None
 		self.lseq = 0
 		self.rseq = 0
-		self.magic = 0
 		self.lasthb = 0
 		self.lastq = None
 		self.lastid = None
 		self.magic = random.randint(0,255)
 		if remote == '':
 			self.server = True
-			#self.serverid = self.magic
 		if opts.find('r') != -1:
 			self.stateful = True
 		if 'c' in opts:
@@ -146,6 +143,7 @@ class ipserverThread(threading.Thread):
 		binq = ''
 		bina = ''
 		if not self.server:
+			print len(msg)
 			if len(msg) > 63:
 				a,b = msg[:len(msg)/2],msg[len(msg)/2:]
 				self.labels = [a,b,'chaumurky','com']
@@ -336,59 +334,61 @@ class ipserverThread(threading.Thread):
 								#sys.stderr.write('M:' + str(magic) + ' F:' + str(flag) + ' RRS:' + str(seq) + ' TRS:' + str(self.rseq) + ' LS:' + str(self.lseq) + ' D:' + data + '\n')
 								if magic != self.magic:
 									self.lasthb = int(round(time.time() * 1000))
-									if flag == SYN and not self.ready:
+									if flag == SYN and seq == 0 and data == '' and not self.ready:
 										self.remote = addr
 										self.state = GOT_SYN
-										#self.serverid = magic
-									if flag == SACK and not self.ready:
+										self.remotemagic = magic
+									elif flag == SACK and seq == 0 and data == '' and not self.ready:
 										if self.state == WAIT_ACK and seq == self.lseq:
 											self.state = IDLE
 											self.ready = True
+											self.remotemagic = magic
 											self.send('', ACK, 0, 8)
 											sys.stderr.write('[*] Connection to ' + self.remote[0] + ' established.\n')
-									elif flag == ACK:
-										if seq == self.lseq:
-											if self.state == WAIT_ACK:
-												self.state = IDLE
-												if not self.ready:
-													self.ready = True
-													sys.stderr.write('[*] Connection from ' + addr[0] + '\n')
-										elif seq < self.lseq:
-											data = ''
-											print 'OUT OF SYNC'
-										else:
-											print 'something crazy'
-									elif flag == PSH:
-										if seq == self.rseq:
+									elif magic == self.remotemagic:
+										if flag == ACK:
+											if seq == self.lseq:
+												if self.state == WAIT_ACK:
+													self.state = IDLE
+													if not self.ready:
+														self.ready = True
+														sys.stderr.write('[*] Connection from ' + addr[0] + '\n')
+											elif seq < self.lseq:
+												data = ''
+												print 'OUT OF SYNC'
+											else:
+												print 'something crazy'
+										elif flag == PSH:
+											if seq == self.rseq:
+												self.send('', ACK, seq, 0)
+												self.rseq += 1
+											elif seq < self.rseq:
+												self.send('', ACK, seq, 0)
+												data = ''
+												print 'Old packet again...'
+											else:
+												print 'Packets from da future?!'
+												#TODO Request old packet again... semething has happened
+										elif flag == BEGSTREAM:
+											self.oqlocked = True
 											self.send('', ACK, seq, 0)
-											self.rseq += 1
-										elif seq < self.rseq:
+										elif flag == ENDSTREAM:
+											self.oqlocked = False
 											self.send('', ACK, seq, 0)
-											data = ''
-											print 'Old packet again...'
-										else:
-											print 'Packets from da future?!'
-											#TODO Request old packet again... semething has happened
-									elif flag == BEGSTREAM:
-										self.oqlocked = True
-										self.send('', ACK, seq, 0)
-									elif flag == ENDSTREAM:
-										self.oqlocked = False
-										self.send('', ACK, seq, 0)
-									elif flag == FIN:
-										sys.stderr.write('[*] Connection from ' + addr[0] + ' closed.\n')
-										self.error = True
-										self.send('', ACK, seq, 0)
-									elif flag == HB:
-										if self.state != WAIT_HB:
-											
+										elif flag == FIN:
+											sys.stderr.write('[*] Connection from ' + addr[0] + ' closed.\n')
+											self.error = True
 											self.send('', ACK, seq, 0)
-										else:
-											self.state = GOT_HB
-									if self.lseq > 254:
-										self.lseq = 0
-									if self.rseq > 254:
-										self.rseq = 0
+										elif flag == HB:
+											if self.state != WAIT_HB:
+												
+												self.send('', ACK, seq, 0)
+											else:
+												self.state = GOT_HB
+										if self.lseq > 254:
+											self.lseq = 0
+										if self.rseq > 254:
+											self.rseq = 0
 								else:
 									data = ''
 						elif self.proto == 'tcp':
