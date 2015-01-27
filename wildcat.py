@@ -128,38 +128,43 @@ class ipserverThread(threading.Thread):
 			self.id = 0x1337
 		else:
 			self.id = self.lastid
-		self.bits = 0x0100
-		self.qcount = 1
-		self.acount = 0
+		bits = 0x0100
+		qcount = 1
+		acount = 0
 		if self.server:
-			self.bits = 0x8180
-			self.acount = 1 
+			bits = 0x8180
+			acount = 1 
 		msg = msg.encode('base64').replace('=','-').strip()
+		n = 126
+		msgs = [msg[i:i+n] for i in range(0, len(msg), n)]
+		qcount = len(msgs)
 		binq = ''
 		bina = ''
 		if not self.server:
-			if len(msg) > 63:
-				a,b = msg[:len(msg)/2],msg[len(msg)/2:]
-				print len(a) + ' ' + len(b)
-				self.labels = [a,b,'chaumurky','com']
-			else:
-				self.labels = [msg,'chaumurky','com']
-			for label in self.labels:
-				binq += struct.pack('B', len(label))
-				binq += label
-			binq += '\0'
-			binq += struct.pack('!HH', 16, 1)
+			for i in msgs:
+				labels = []
+				if len(msg) > 63:
+					a,b = i[:len(i)/2],i[len(i)/2:]
+					labels = [a,b,'chaumurky','com']
+				else:
+					labels = [i,'chaumurky','com']
+				for label in labels:
+					binq += struct.pack('B', len(label))
+					binq += label
+				binq += '\0'
+				binq += struct.pack('!HH', 16, 1)
 		else:
-			binq  = ' '.join(self.lastq)
+			binq  = ''.join(self.lastq)
 			name = 49164
 			type = 16
+			qcount = len(self.lastq)
 			cls = 1
 			ttl = 1
 			dlen = len(msg) + 1
 			tlen = len(msg)
 			bina = struct.pack('!HHHIHB',name, type, cls, ttl, dlen, tlen)
 			bina += msg
-		binpckt = struct.pack('!HHHHHH', self.id, self.bits, self.qcount, self.acount, 0, 0)
+		binpckt = struct.pack('!HHHHHH', self.id, bits, qcount, acount, 0, 0)
 		binpckt += binq + bina
 		
 		return binpckt
@@ -176,7 +181,7 @@ class ipserverThread(threading.Thread):
 				msg = zlib.compress(msg)
 			n = MAX_PACKET_SIZE
 			if self.proto == 'dns':
-				n = 90
+				n = 200
 			msgs = [msg[i:i+n] for i in range(0, len(msg), n)]
 			if len(msgs) == 0:
 				msgs.append('')
@@ -198,7 +203,7 @@ class ipserverThread(threading.Thread):
 						curr_time = int(round(time.time() * 1000))
 						i = chr(self.magic) + chr(flag) + chr(seq) + i
 						while self.state == WAIT_HB:
-							time.sleep(0.001)
+							time.sleep(0.01)
 							timeout = int(round(time.time() * 1000))
 							if curr_time - timeout > NETWORK_TIMEOUT:
 								sys.stderr.write('[!] Connection timed out!\n')
@@ -216,14 +221,13 @@ class ipserverThread(threading.Thread):
 							print 'ERROR1'
 							pass
 							#TODO send error handling
+						# Retransmission timer / WAIT_ACK handler
 						if flag != ACK:
 							self.state = WAIT_ACK
-						# Retransmission timer / WAIT_ACK handler
-						if flag != ACK: 
 							start_time = int(round(time.time() * 1000))
 							timeout = int(round(time.time() * 1000))
 							while (self.state == WAIT_ACK) and self.running:
-								time.sleep(0.001)
+								time.sleep(0.0001)
 								curr_time = int(round(time.time() * 1000))
 								if curr_time - timeout > NETWORK_TIMEOUT:
 									sys.stderr.write('[!] Connection timed out!\n')
@@ -243,6 +247,8 @@ class ipserverThread(threading.Thread):
 						successful = True
 						if flag == PSH:
 							self.lseq += 1
+							if self.lseq > 254:
+								self.lseq = 0
 				else:
 					if self.proto == 'icmp':
 						packet = self.icmp_make(i, type)
@@ -319,18 +325,13 @@ class ipserverThread(threading.Thread):
 									data = ''
 									for i in labels:
 										data += i
-											sys.stderr.write('[!] Erroneous base64 packet.\n')
-											sys.stderr.write('>>>' + i + '<<<\n')
-											self.error = True
-											continue
-								else:
-									try:
-										data = data.replace('-','=').decode('base64')
-									except:
-										sys.stderr.write('[!] Erroneous base64 packet.\n')
-										sys.stderr.write('>>>' + i + '<<<\n')
-										self.error = True
-										continue
+								try:
+									data = data.replace('-','=').decode('base64')
+								except:
+									sys.stderr.write('[!] Erroneous base64 packet.\n')
+									sys.stderr.write('>>>' + str(i) + '<<<\n')
+									self.error = True
+									continue
 
 							if self.stateful and len(data) > 2:
 								magic = ord(data[0])
@@ -389,8 +390,6 @@ class ipserverThread(threading.Thread):
 												self.send('', ACK, seq, 0)
 											else:
 												self.state = GOT_HB
-										if self.lseq > 254:
-											self.lseq = 0
 										if self.rseq > 254:
 											self.rseq = 0
 								else:
@@ -405,7 +404,7 @@ class ipserverThread(threading.Thread):
 							if data != '':
 								self.oq.put(data)
 						inp, outp, excpt = select.select(self.input,[],[],0)
-			time.sleep(0.1)
+			time.sleep(0.01)
 
 	def run(self):
 		if (self.proto == 'udp' or self.proto == 'icmp' or self.proto == 'dns') and not self.stateful:
