@@ -140,6 +140,7 @@ class ipserverThread(threading.Thread):
 		if not self.server:
 			if len(msg) > 63:
 				a,b = msg[:len(msg)/2],msg[len(msg)/2:]
+				print len(a) + ' ' + len(b)
 				self.labels = [a,b,'chaumurky','com']
 			else:
 				self.labels = [msg,'chaumurky','com']
@@ -175,7 +176,7 @@ class ipserverThread(threading.Thread):
 				msg = zlib.compress(msg)
 			n = MAX_PACKET_SIZE
 			if self.proto == 'dns':
-				n = DNS_LABEL_LEN
+				n = 90
 			msgs = [msg[i:i+n] for i in range(0, len(msg), n)]
 			if len(msgs) == 0:
 				msgs.append('')
@@ -317,15 +318,20 @@ class ipserverThread(threading.Thread):
 								if acount == 0:
 									data = ''
 									for i in labels:
-										try:
-											data += i.replace('-','=').decode('base64')
-										except:
-											sys.stderr.write('[!] Erroneous base64 packet.')
-											sys.stderr.write('>>>' + i + '<<<')
+										data += i
+											sys.stderr.write('[!] Erroneous base64 packet.\n')
+											sys.stderr.write('>>>' + i + '<<<\n')
 											self.error = True
 											continue
 								else:
-									data = data.replace('-','=').decode('base64')
+									try:
+										data = data.replace('-','=').decode('base64')
+									except:
+										sys.stderr.write('[!] Erroneous base64 packet.\n')
+										sys.stderr.write('>>>' + i + '<<<\n')
+										self.error = True
+										continue
+
 							if self.stateful and len(data) > 2:
 								magic = ord(data[0])
 								flag = ord(data[1])
