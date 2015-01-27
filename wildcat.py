@@ -7,7 +7,7 @@ from Queue import Queue
 HEART_BEAT_TIME = 5000
 RETRANSMIT_TIME = 1000
 NETWORK_TIMEOUT = 30000
-MAX_PACKET_SIZE = 10
+MAX_PACKET_SIZE = 500
 DNS_LABEL_LEN = 63
 
 ICMP_CODE = socket.getprotobyname('icmp')
@@ -333,7 +333,7 @@ class ipserverThread(threading.Thread):
 								flag = ord(data[1])
 								seq = ord(data[2])
 								data = data[3:]
-								sys.stderr.write('M:' + str(magic) + ' F:' + str(flag) + ' RRS:' + str(seq) + ' TRS:' + str(self.rseq) + ' LS:' + str(self.lseq) + ' D:' + data + '\n')
+								#sys.stderr.write('M:' + str(magic) + ' F:' + str(flag) + ' RRS:' + str(seq) + ' TRS:' + str(self.rseq) + ' LS:' + str(self.lseq) + ' D:' + data + '\n')
 								if magic != self.magic:
 									self.lasthb = int(round(time.time() * 1000))
 									if flag == SYN and not self.ready:
@@ -372,11 +372,9 @@ class ipserverThread(threading.Thread):
 									elif flag == BEGSTREAM:
 										self.oqlocked = True
 										self.send('', ACK, seq, 0)
-										self.rseq += 1
 									elif flag == ENDSTREAM:
 										self.oqlocked = False
 										self.send('', ACK, seq, 0)
-										self.rseq += 1
 									elif flag == FIN:
 										sys.stderr.write('[*] Connection from ' + addr[0] + ' closed.\n')
 										self.error = True
