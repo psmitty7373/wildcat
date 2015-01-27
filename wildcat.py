@@ -31,11 +31,6 @@ DECOMPRESS = 2
 
 #sysctl -w net.ipv4.icmp_echo_ignore_all=1
 
-def spinning_cursor():
-    while True:
-        for cursor in '|/-\\':
-            yield cursor
-
 def tcpclient(host, port):
 	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 	s.connect((host,port))
@@ -143,7 +138,6 @@ class ipserverThread(threading.Thread):
 		binq = ''
 		bina = ''
 		if not self.server:
-			print len(msg)
 			if len(msg) > 63:
 				a,b = msg[:len(msg)/2],msg[len(msg)/2:]
 				self.labels = [a,b,'chaumurky','com']
@@ -298,7 +292,7 @@ class ipserverThread(threading.Thread):
 								icmp_hdr = data[20:28]
 								type, code, chksum, id, seq = struct.unpack('bbHHh', icmp_hdr)
 								data = data[28:]
-							elif self.proto == 'dns':
+							elif self.proto == 'dns' and len(data) > 20:
 								dns_hdr = data[0:12]
 								id, bits, qcount, acount, ncount, rcount = struct.unpack('!HHHHHH', dns_hdr)
 								self.lastid = id
@@ -323,7 +317,13 @@ class ipserverThread(threading.Thread):
 								if acount == 0:
 									data = ''
 									for i in labels:
-										data += i.replace('-','=').decode('base64')
+										try:
+											data += i.replace('-','=').decode('base64')
+										except:
+											sys.stderr.write('[!] Erroneous base64 packet.')
+											sys.stderr.write('>>>' + i + '<<<')
+											self.error = True
+											continue
 								else:
 									data = data.replace('-','=').decode('base64')
 							if self.stateful and len(data) > 2:
@@ -365,7 +365,6 @@ class ipserverThread(threading.Thread):
 											elif seq < self.rseq:
 												self.send('', ACK, seq, 0)
 												data = ''
-												print 'Old packet again...'
 											else:
 												print 'Packets from da future?!'
 												#TODO Request old packet again... semething has happened
@@ -381,7 +380,6 @@ class ipserverThread(threading.Thread):
 											self.send('', ACK, seq, 0)
 										elif flag == HB:
 											if self.state != WAIT_HB:
-												
 												self.send('', ACK, seq, 0)
 											else:
 												self.state = GOT_HB
@@ -486,7 +484,8 @@ arguments:
       e.g. tcp://127.0.0.1:8080 for a listener on the lo using tcp on port 8080
       e.g. icmp://0.0.0.0:0:192.168.1.1 for a client on all ints using icmp to 192.168.1.1
   -o  data source options in the form of a non-spaced string
-	r  "reliable" connection (only applies to UDP, ICMP, DNS, and NTP connections
+	r    "reliable" connection (only applies to UDP, ICMP, DNS, and NTP connections
+	c|d  compress or decompress traffic using zlib compression
 
 data source options:
 '''
@@ -497,8 +496,6 @@ def main():
 	ready = False
 	taps = []
 	threads = []
-	spinner = spinning_cursor()
-	
 	if len(sys.argv) == 1:
 		help()
 		sys.exit(1)
@@ -528,7 +525,6 @@ def main():
 			sys.stderr.write('[*] Starting stdin.\n')
 			t = stdThread(opts)
 			threads.append(t)
-			t.start()
 		elif i[0][0:6] == 'tcp://' or i[0][0:6] == 'udp://' or i[0][0:7] == 'icmp://' or i[0][0:6] == 'dns://':
 			proto = i[0].split(':')[0]
 			ip = i[0].split(proto + '://')[1].split(':')[0]
@@ -538,11 +534,13 @@ def main():
 				remote = (i[0].split(proto + '://')[1].split(':')[2], int(port))
 			sys.stderr.write('[*] Starting socket on ' + proto + ' ' + ip + ':' + port + '\n')
 			t = ipserverThread(ip, port, proto, remote, opts)
-			t.start()
 			threads.append(t)
 		else:
 			help()
 			running = False
+	if running:
+		for i in threads:
+			i.start()
 	try:
 		while len(threads) > 0 and running:
 			done = False
@@ -555,10 +553,8 @@ def main():
 					queuesempty = False
 				if t.done == True:
 					done = True
-
 			if done and queuesempty:
 				running = False
-				
 			if not ready:
 				ready = True
 				for t in threads:
@@ -576,14 +572,9 @@ def main():
 								if t2.name != name:
 									t2.send(msg)
 				threads = [t for t in threads if t.isAlive()]
-			#sys.stdout.write(spinner.next())
-			#sys.stdout.flush()
 			time.sleep(0.1)
-			#sys.stdout.write('\b')
-
 	except KeyboardInterrupt:
 		running = False
-
 	sys.stderr.write('Shutting down...\n')
 	for t in threads:
 		t.running = False
