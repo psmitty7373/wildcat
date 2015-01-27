@@ -1,6 +1,8 @@
 #!/usr/bin/python
 
-import argparse, random, re, select, socket, struct, sys, threading, time, zlib
+import argparse, random, re, select, socket, struct, subprocess, sys, threading, time, zlib
+from fcntl import fcntl, F_GETFL, F_SETFL
+from os import O_NONBLOCK, read
 from threading import Thread
 from Queue import Queue
 
@@ -9,6 +11,7 @@ RETRANSMIT_TIME = 1000
 NETWORK_TIMEOUT = 30000
 MAX_PACKET_SIZE = 500
 DNS_LABEL_LEN = 63
+DNS_MAX_QUESTIONS = 1
 
 ICMP_CODE = socket.getprotobyname('icmp')
 SYN = 0
@@ -181,7 +184,7 @@ class ipserverThread(threading.Thread):
 				msg = zlib.compress(msg)
 			n = MAX_PACKET_SIZE
 			if self.proto == 'dns':
-				n = 200
+				n = 90
 			msgs = [msg[i:i+n] for i in range(0, len(msg), n)]
 			if len(msgs) == 0:
 				msgs.append('')
@@ -193,6 +196,7 @@ class ipserverThread(threading.Thread):
 						self.state = WAIT_HB
 						type = 0
 			if self.compress == COMPRESS and flag == PSH:
+				size = struct.pack('!I',len(msg))
 				self.send('', BEGSTREAM, 0)
 			for i in msgs:
 				if self.stateful:
@@ -443,10 +447,10 @@ class ipserverThread(threading.Thread):
 			self.s.close()
 			self.c.close()
 		except:
-			pass
+			passa
 
 class stdThread(threading.Thread):
-	def __init__(self, opts):
+	def __init__(self, opts, cmd = ''):
 		threading.Thread.__init__(self)
 		self.running = True
 		self.error = False
@@ -456,20 +460,34 @@ class stdThread(threading.Thread):
 		self.ready = True
 		self.opts = opts
 		self.compress = None
+		self.cmd = cmd
+		self.inp = None
+		self.outp = None
+		if self.cmd == '':
+			self.proc = sys
+			self.outp = sys.stdout
+			self.inp = sys.stdin
+		else:
+			self.proc = subprocess.Popen(['/bin/bash'], shell=False, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+			flags = fcntl(self.proc.stdout, F_GETFL)
+			fcntl(self.proc.stdout, F_SETFL, flags | O_NONBLOCK)
+			self.outp = self.proc.stdin
+			self.inp = self.proc.stdout
 		if 'd' in opts:
 			self.compress = DECOMPRESS
 	def send(self, msg):
 		if self.compress == DECOMPRESS:
 			msg = zlib.decompress(msg)
-		sys.stdout.write(msg),
-		sys.stdout.flush()
+		self.outp.write(msg)
+		if self.cmd == '':
+			self.outp.flush()
 	def run(self):
 		while self.running:
 			if not self.error and not self.done:
 				msg = ''
-				while sys.stdin in select.select([sys.stdin],[],[], 0)[0]:
-
-					line = sys.stdin.readline()
+				while self.inp in select.select([self.inp],[],[], 0)[0]:
+					#line = self.inp.readline()
+					line = read(self.inp.fileno(), 1024)
 					if line:
 						msg = msg + line
 					else:
@@ -529,6 +547,10 @@ def main():
 		if i[0] == 'std':
 			sys.stderr.write('[*] Starting stdin.\n')
 			t = stdThread(opts)
+			threads.append(t)
+		elif i[0] == 'cmd':
+			sys.stderr.write('[*] Starting command.\n')
+			t = stdThread(opts, 'abcd')
 			threads.append(t)
 		elif i[0][0:6] == 'tcp://' or i[0][0:6] == 'udp://' or i[0][0:7] == 'icmp://' or i[0][0:6] == 'dns://':
 			proto = i[0].split(':')[0]
