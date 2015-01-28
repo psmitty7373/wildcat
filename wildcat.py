@@ -1,5 +1,10 @@
 #!/usr/bin/python
 
+# Wildcat - Netcat All The Things!
+# Written by psmitty7373
+# Twitter - @psmitty7373
+# Github - https://github.com/psmitty7373/wildcat
+
 import argparse, random, re, select, socket, struct, subprocess, sys, threading, time, zlib
 from fcntl import fcntl, F_GETFL, F_SETFL
 from os import O_NONBLOCK, read
@@ -13,7 +18,6 @@ MAX_PACKET_SIZE = 500
 DNS_LABEL_LEN = 63
 DNS_MAX_QUESTIONS = 1
 
-ICMP_CODE = socket.getprotobyname('icmp')
 SYN = 0
 ACK = 1
 SACK = 2
@@ -34,16 +38,6 @@ DECOMPRESS = 2
 
 #sysctl -w net.ipv4.icmp_echo_ignore_all=1
 
-def tcpclient(host, port):
-	s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-	s.connect((host,port))
-	while True:
-		data = s.recv(1024)
-		if data == '':
-			break
-		print data
-	s.close()
-
 class ipserverThread(threading.Thread):
 	def __init__(self, ip, port, proto, remote, opts):
 		threading.Thread.__init__(self)
@@ -53,9 +47,9 @@ class ipserverThread(threading.Thread):
 		self.port = port
 		self.proto = proto
 		self.server = False
-		self.remotemagic = None
+		self.remoteid = None
 		self.remote = remote
-		self.opts = opts
+		self.opts = opts.split(',')
 		self.running = True
 		self.error = False
 		self.done = False
@@ -72,18 +66,40 @@ class ipserverThread(threading.Thread):
 		self.lasthb = 0
 		self.lastq = None
 		self.lastid = None
-		self.magic = random.randint(0,255)
+		self.dnsname = None
 		if remote == '':
 			self.server = True
-		if opts.find('r') != -1:
-			self.stateful = True
-		if 'c' in opts:
-			self.compress = COMPRESS
-		if 'd' in opts:
-			self.compress = DECOMPRESS
+			self.id = random.randint(128,255)
+		else:
+			self.id = random.randint(0,128)
+		if len(self.opts) > 0 and self.opts[0] != '':
+			for i in self.opts:
+				if i == 'r':
+					self.stateful = True
+				elif i == 'c':
+					self.compress = COMPRESS
+				elif i == 'd':
+					self.compress = DECOMPRESS
+				elif i[0:4] == 'dns=' and self.proto == 'dns':
+					i = i.split('=')
+					if len(i) == 2:
+						i = i[1].split('.')
+						if len(i) == 2:
+							self.dnsname = i
+						else:
+							sys.stderr.write('[!] Error! A dns=<dns.name> option is required for the DNS protocol.\n')
+							self.error = True
+					else:
+						sys.stderr.write('[!] Error! A dns=<dns.name> option is required for the DNS protocol.\n')
+						self.error = True
+				else:
+					sys.stderr.write('[!] Error! Invalid option >>>' + i + '<<<\n')
+					self.error = True
+		if self.proto == 'dns' and self.dnsname == None:
+			sys.stderr.write('[!] Error! A dns=<dns.name> option is required for the DNS protocol.\n')
+			self.error = True
 		self.recvthread = threading.Thread(target=self.recv)
 		self.recvthread.daemon = True
-
 
 	def openSocket(self):
 		try:
@@ -93,17 +109,23 @@ class ipserverThread(threading.Thread):
 				self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 				self.s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
 			elif self.proto == 'icmp':
-				self.s = socket.socket(socket.AF_INET,socket.SOCK_RAW, ICMP_CODE)
+				self.s = socket.socket(socket.AF_INET,socket.SOCK_RAW, socket.getprotobyname('icmp'))
+				self.s.bind((self.ip,0))
 			else:
 				return False
 			if not self.proto == 'icmp' and self.server:
 				self.s.bind((self.ip,int(self.port)))
-			if self.proto == 'tcp':
+			if self.proto == 'tcp' and self.server:
 				self.s.listen(1)
+			elif self.proto == 'tcp':
+				sys.stderr.write('[*] Connecting to ' + self.remote[0] + ' on ' + self.proto + ' ' + str(self.remote[1]) + '.\n')
+				self.s.connect(self.remote)
+				self.ready = True
 		except:
 			sys.stderr.write('[!] Unable to open socket.\n')
 			return False
-		sys.stderr.write('[*] Listening on port ' + str(self.port) + '\n')
+		if self.server:
+			sys.stderr.write('[*] Listening on port ' + str(self.port) + '\n')
 
 		return True
 
@@ -127,10 +149,11 @@ class ipserverThread(threading.Thread):
 		return cksum
 
 	def dns_make(self, msg):
+		id = 0
 		if not self.server:
-			self.id = 0x1337
+			id = 0x1337
 		else:
-			self.id = self.lastid
+			id = self.lastid
 		bits = 0x0100
 		qcount = 1
 		acount = 0
@@ -167,15 +190,19 @@ class ipserverThread(threading.Thread):
 			tlen = len(msg)
 			bina = struct.pack('!HHHIHB',name, type, cls, ttl, dlen, tlen)
 			bina += msg
-		binpckt = struct.pack('!HHHHHH', self.id, bits, qcount, acount, 0, 0)
+		binpckt = struct.pack('!HHHHHH', id, bits, qcount, acount, 0, 0)
 		binpckt += binq + bina
 		
 		return binpckt
 
 	def icmp_make(self, msg, type):
-		header = struct.pack('bbHHh', type, 0, 0, self.serverid, 1)
+		if not self.server:
+			id = random.randint(0,65535)
+		else:
+			id = self.lastid
+		header = struct.pack('bbHHh', type, 0, 0, id, 1)
 		cksum = self.icmp_cksum(header + msg)
-		header = struct.pack('bbHHh', type, 0, socket.htons(cksum), self.serverid, 1)
+		header = struct.pack('bbHHh', type, 0, socket.htons(cksum), id, 1)
 		return header + msg
 
 	def send(self, msg, flag=PSH, seq=-1, type=8):
@@ -190,12 +217,12 @@ class ipserverThread(threading.Thread):
 				msgs.append('')
 			if self.stateful:
 				if flag == PSH or flag == BEGSTREAM or flag == ENDSTREAM:
-					if not self.server:
+					if not self.server or self.proto == 'udp':
 						self.state = WAIT_ACK
 					else:
 						self.state = WAIT_HB
 						type = 0
-			if self.compress == COMPRESS and flag == PSH:
+			if self.compress == COMPRESS and flag == PSH and len(msgs) > 1:
 				size = struct.pack('!I',len(msg))
 				self.send('', BEGSTREAM, 0)
 			for i in msgs:
@@ -205,7 +232,7 @@ class ipserverThread(threading.Thread):
 					successful = False
 					while not successful:
 						curr_time = int(round(time.time() * 1000))
-						i = chr(self.magic) + chr(flag) + chr(seq) + i
+						i = chr(self.id) + chr(flag) + chr(seq) + i
 						while self.state == WAIT_HB:
 							time.sleep(0.01)
 							timeout = int(round(time.time() * 1000))
@@ -222,9 +249,9 @@ class ipserverThread(threading.Thread):
 						try:
 							self.s.sendto(packet, (self.remote))
 						except:
-							print 'ERROR1'
-							pass
-							#TODO send error handling
+							sys.stderr.write('[!] Error! Unable to send packet.\n')
+							self.error = True
+							break
 						# Retransmission timer / WAIT_ACK handler
 						if flag != ACK:
 							self.state = WAIT_ACK
@@ -265,7 +292,7 @@ class ipserverThread(threading.Thread):
 					except:	
 						pass
 						#TODO send error handling
-			if self.compress == COMPRESS and flag == PSH:
+			if self.compress == COMPRESS and flag == PSH and len(msgs) > 1:
 				self.send('', ENDSTREAM, 0)
 		else:
 			try:
@@ -277,7 +304,7 @@ class ipserverThread(threading.Thread):
 
 	def recv(self):
 		while self.running and not self.error:
-			if not self.ready and self.proto == 'tcp':
+			if not self.ready and self.proto == 'tcp' and self.server:
 				inp, outp, excpt = select.select([self.s],[],[],0)
 				for x in inp:
 					if x == self.s:
@@ -302,6 +329,8 @@ class ipserverThread(threading.Thread):
 							if self.proto == 'icmp':
 								icmp_hdr = data[20:28]
 								type, code, chksum, id, seq = struct.unpack('bbHHh', icmp_hdr)
+								if self.server:
+									self.lastid = id
 								data = data[28:]
 							elif self.proto == 'dns' and len(data) > 20:
 								dns_hdr = data[0:12]
@@ -338,25 +367,25 @@ class ipserverThread(threading.Thread):
 									continue
 
 							if self.stateful and len(data) > 2:
-								magic = ord(data[0])
+								sid = ord(data[0])
 								flag = ord(data[1])
 								seq = ord(data[2])
 								data = data[3:]
-								#sys.stderr.write('M:' + str(magic) + ' F:' + str(flag) + ' RRS:' + str(seq) + ' TRS:' + str(self.rseq) + ' LS:' + str(self.lseq) + ' D:' + data + '\n')
-								if magic != self.magic:
+								#sys.stderr.write('M:' + str(sid) + ' F:' + str(flag) + ' RRS:' + str(seq) + ' TRS:' + str(self.rseq) + ' LS:' + str(self.lseq) + ' D:' + data + '\n')
+								if sid != self.id:
 									self.lasthb = int(round(time.time() * 1000))
 									if flag == SYN and seq == 0 and data == '' and not self.ready:
 										self.remote = addr
 										self.state = GOT_SYN
-										self.remotemagic = magic
+										self.remoteid = sid
 									elif flag == SACK and seq == 0 and data == '' and not self.ready:
 										if self.state == WAIT_ACK and seq == self.lseq:
 											self.state = IDLE
 											self.ready = True
-											self.remotemagic = magic
+											self.remoteid = sid
 											self.send('', ACK, 0, 8)
 											sys.stderr.write('[*] Connection to ' + self.remote[0] + ' established.\n')
-									elif magic == self.remotemagic:
+									elif sid == self.remoteid:
 										if flag == ACK:
 											if seq == self.lseq:
 												if self.state == WAIT_ACK:
@@ -399,9 +428,17 @@ class ipserverThread(threading.Thread):
 								else:
 									data = ''
 						elif self.proto == 'tcp':
-							data = self.c.recv(16384)
+							try:
+								data = self.c.recv(16384)
+							except:
+								self.error = True
+								sys.stderr.write('[!] Error! Recieve error.\n')
+								break
 						if self.proto == 'tcp' and len(data) == 0:
-							sys.stderr.write('[!] Connection from ' + self.addr[0] + ' lost.\n')
+							if self.server:
+								sys.stderr.write('[!] Connection from ' + self.addr[0] + ' lost.\n')
+							else:
+								sys.stderr.write('[!] Connection to ' + self.remote[0] + ' lost.\n')
 							self.error = True
 							break
 						else:
@@ -439,15 +476,19 @@ class ipserverThread(threading.Thread):
 								self.state = WAIT_ACK
 			time.sleep(0.05)
 		if not self.error and self.stateful and self.ready:
-			self.state = WAIT_ACK
+			if self.server:
+				self.state = WAIT_ACK
+			else:
+				self.state = WAIT_HB
 			self.send('', FIN)
 		self.recvthread.running = False
-		self.recvthread.join()
+		if self.recvthread.isAlive():
+			self.recvthread.join()
 		try:
 			self.s.close()
 			self.c.close()
 		except:
-			passa
+			pass
 
 class stdThread(threading.Thread):
 	def __init__(self, opts, cmd = ''):
@@ -499,16 +540,24 @@ class stdThread(threading.Thread):
 def help():
 	print '''usage: wildcat.py [-h] -u url [-o options]
 
-WildCat
+WildCat - netcat all the things!!
+
+modes supported:
+  tcp  standard tcp connection, supports compression
+  udp  standard unreliable udp connection, supports compression and reliability add-on
+  icmp standard icmp connection, typically "one-way", supports compression and reliability add-on
+  dns  requires ownership of a DNS name that points to the IP where your wildcat listener is deployed
 
 arguments:
   -h, --help  show this help message and exit
-  -u  data source url in format proto://listenip:port[:destip]
+  -u  data source url in format proto://localip:port[:destip]
       e.g. tcp://127.0.0.1:8080 for a listener on the lo using tcp on port 8080
       e.g. icmp://0.0.0.0:0:192.168.1.1 for a client on all ints using icmp to 192.168.1.1
-  -o  data source options in the form of a non-spaced string
-	r    "reliable" connection (only applies to UDP, ICMP, DNS, and NTP connections
-	c|d  compress or decompress traffic using zlib compression
+  -o  data source options in the form of a comma-separated string
+      e.g. -o cr for compression and reliable connection
+	r     "reliable" connection (only applies to UDP, ICMP, DNS, and NTP connections
+	c|d   compress or decompress traffic using zlib compression
+	dns=  DNS server name to use in DNS relay connection
 
 data source options:
 '''
@@ -531,9 +580,11 @@ def main():
 	for i in params:
 		if last == '-o' and i == '-o':
 			help()
+			sys.exit(1)
 		last = i
 		if i != '-u' and i != '-o':
 			help()
+			sys.exit(1)
 	args = re.split('\s*-u\s*', args)
 	args = filter(None, args)
 	argss = []
@@ -559,7 +610,7 @@ def main():
 			remote = ''
 			if len(i[0].split(proto + '://')[1].split(':')) > 2:
 				remote = (i[0].split(proto + '://')[1].split(':')[2], int(port))
-			sys.stderr.write('[*] Starting socket on ' + proto + ' ' + ip + ':' + port + '\n')
+			sys.stderr.write('[*] Opening socket on ' + proto + ' ' + ip + '\n')
 			t = ipserverThread(ip, port, proto, remote, opts)
 			threads.append(t)
 		else:
