@@ -216,7 +216,9 @@ class ipserverThread(threading.Thread):
 			if len(msgs) == 0:
 				msgs.append('')
 			if self.stateful:
-				if flag == PSH or flag == BEGSTREAM or flag == ENDSTREAM:
+				if flag == FIN:
+					print 'Sending FIN!'
+				if flag == PSH or flag == BEGSTREAM or flag == ENDSTREAM or flag == FIN:
 					if not self.server or self.proto == 'udp':
 						self.state = WAIT_ACK
 					else:
@@ -363,7 +365,6 @@ class ipserverThread(threading.Thread):
 								except:
 									sys.stderr.write('[!] Erroneous base64 packet.\n')
 									sys.stderr.write('>>>' + str(i) + '<<<\n')
-									self.error = True
 									continue
 
 							if self.stateful and len(data) > 2:
@@ -475,11 +476,8 @@ class ipserverThread(threading.Thread):
 								self.lasthb = int(round(time.time() * 1000))
 								self.state = WAIT_ACK
 			time.sleep(0.05)
+		print 'Stopping this guy.'
 		if not self.error and self.stateful and self.ready:
-			if self.server:
-				self.state = WAIT_ACK
-			else:
-				self.state = WAIT_HB
 			self.send('', FIN)
 		self.recvthread.running = False
 		if self.recvthread.isAlive():
@@ -656,6 +654,7 @@ def main():
 	sys.stderr.write('Shutting down...\n')
 	for t in threads:
 		t.running = False
+		print 'Stopping:' + t.name
 		t.join()
 	sys.stderr.write('Quit.\n')
 		
