@@ -5,7 +5,7 @@
 # Twitter - @psmitty7373
 # Github - https://github.com/psmitty7373/wildcat
 
-import argparse, base64, os, pty, random, re, select, socket, StringIO, struct, subprocess, sys, threading, time, zlib
+import argparse, base64, os, pty, random, re, select, socket, struct, subprocess, sys, threading, time, zlib
 from fcntl import fcntl, F_GETFL, F_SETFL
 from threading import Thread
 from Queue import Queue
