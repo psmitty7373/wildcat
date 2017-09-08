@@ -38,6 +38,7 @@ HTTP_REQ_TEMPLATE = \
 Host: $HOST
 Connection: keep-alive
 Cache-Control: max-age=0
+Content-Length: $BYTES
 Upgrade-Insecure-Requests: 1
 User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36
 Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8
@@ -48,7 +49,6 @@ $PAYLOAD'''
 
 HTTP_RESP_TEMPLATE = \
 '''HTTP/1.1 200 OK
-Date: $DATE
 Server: Apache/2.4.10 (Debian) OpenSSL/1.0.1t
 Content-Length: $BYTES
 Keep-Alive: timeout=15, max=100
@@ -88,6 +88,9 @@ class ipserverThread(threading.Thread):
         self.bidirectional = opts['bidirectional']
         self.verbose = opts['verbose']
         self.persistent = opts['persistent']
+        self.sleep = opts['sleep']
+        self.sleeping = False
+        self.lastsleep = None
         self.maxpacketsize = MAX_PACKET_SIZE
         self.txheader = True
         self.rxheader = True
@@ -142,9 +145,16 @@ class ipserverThread(threading.Thread):
             if (self.proto == 'tcp' or self.proto == 'http')and self.server:
                 self.s.listen(1)
             elif self.proto == 'tcp' or self.proto == 'http':
+                self.stateful = False
                 sys.stderr.write('[*] Connecting to ' + self.remote[0] + ' on ' + self.proto + ' ' + str(self.remote[1]) + '.\n')
                 self.s.connect(self.remote)
+                self.lastsleep = int(round(time.time() * 1000))
                 self.ready = True
+            self.input = self.s
+            if not self.server:
+                self.c = self.s
+            if not self.recvthread.isAlive():
+                self.recvthread.start()
         except:
             sys.stderr.write('[!] Unable to open socket.\n')
             return False
@@ -201,30 +211,30 @@ class ipserverThread(threading.Thread):
         else:
             binq  = ''.join(self.lastq)
             name = 49164
-            type = 16
+            typ = 16
             qcount = len(self.lastq)
             cls = 1
             ttl = 1
             dlen = len(msg) + 1
             tlen = len(msg)
-            bina = struct.pack('!HHHIHB',name, type, cls, ttl, dlen, tlen)
+            bina = struct.pack('!HHHIHB',name, typ, cls, ttl, dlen, tlen)
             bina += msg
         binpckt = struct.pack('!HHHHHH', id, bits, qcount, acount, 0, 0)
         binpckt += binq + bina
         
         return binpckt
 
-    def icmp_make(self, msg, type):
+    def icmp_make(self, msg, typ):
         if not self.server:
             id = random.randint(0,65535)
         else:
             id = self.lastid
-        header = struct.pack('bbHHh', type, 0, 0, id, 1)
+        header = struct.pack('bbHHh', typ, 0, 0, id, 1)
         cksum = self.icmp_cksum(header + msg)
-        header = struct.pack('bbHHh', type, 0, socket.htons(cksum), id, 1)
+        header = struct.pack('bbHHh', typ, 0, socket.htons(cksum), id, 1)
         return header + msg
 
-    def send(self, msg, flag=PSH, seq=-1, type=8):
+    def send(self, msg, flag=PSH, seq=-1, typ=8):
         if self.compress and msg != '':
             msg = zlib.compress(msg)
         # ICMP / UDP / DNS
@@ -239,7 +249,7 @@ class ipserverThread(threading.Thread):
                         self.state = WAIT_ACK
                     else:
                         self.state = WAIT_HB
-                        type = 0
+                        typ = 0
             if self.compress and flag == PSH and len(msgs) > 1:
                 self.send('', BEGSTREAM, 0)
             for i in msgs:
@@ -267,7 +277,7 @@ class ipserverThread(threading.Thread):
                                     self.error = True
                                     return False
                         if self.proto == 'icmp':
-                            packet = self.icmp_make(i, type)
+                            packet = self.icmp_make(i, typ)
                         elif self.proto == 'dns':
                             packet = self.dns_make(i)
                         else:
@@ -308,6 +318,7 @@ class ipserverThread(threading.Thread):
                                         pass
                                         #TODO send error handling
                                     start_time = int(round(time.time() * 1000))
+                            print 'got ack'
                         successful = True
                         if flag == PSH:
                             self.lseq += 1
@@ -315,11 +326,12 @@ class ipserverThread(threading.Thread):
                                 self.lseq = 0
                         elif flag == FIN:
                             sys.stderr.write('[!] Sent FIN!\n')
-                            self.done = True
+                            if not self.sleep:
+                                self.done = True
                 # stateless send
                 else:
                     if self.proto == 'icmp':
-                        packet = self.icmp_make(i, type)
+                        packet = self.icmp_make(i, typ)
                     elif self.proto == 'dns':
                         packet = self.dns_make(i)
                     else:
@@ -343,7 +355,7 @@ class ipserverThread(threading.Thread):
                             time.sleep(0.05)
                         msg = HTTP_RESP_TEMPLATE.replace('\n','\r\n').replace('$BYTES',str(len(msg))).replace('$PAYLOAD',msg)
                     else:
-                        msg = HTTP_REQ_TEMPLATE.replace('\n','\r\n').replace('$PAYLOAD',msg)
+                        msg = HTTP_REQ_TEMPLATE.replace('\n','\r\n').replace('$BYTES',str(len(msg))).replace('$HOST', self.remote[0]).replace('$PAYLOAD',msg)
                 self.c.sendall(msg)
             except:
                 sys.stderr.write('[!] Send error 3\n')
@@ -369,18 +381,19 @@ class ipserverThread(threading.Thread):
                     if x == self.s:
                         try:
                             self.c, self.addr = self.s.accept()
-                            self.ready = True
-                            self.input = [self.c]
+                            self.input = self.c
                             self.c.setblocking(0)
                             sys.stderr.write('[*] Connection from ' + str(self.addr[0]) + '\n')
+                            self.ready = True
+                            self.lastsleep = int(round(time.time() * 1000))
                         except:
                             sys.stderr.write('[!] Connection error.\n')
                             self.error = True
                             self.running = False
             # TCP client, UDP, ICMP, DNS
             else:
-                if self.input != None:    
-                    inp, outp, excpt = select.select(self.input,[],[],0)
+                if self.input and type(self.input.fileno()) == int:
+                    inp, outp, excpt = select.select([self.input],[],[],0)
                     while not self.error and inp:
                         # UDP / ICMP / DNS
                         if self.proto == 'udp' or self.proto == 'icmp' or self.proto == 'dns':
@@ -393,7 +406,7 @@ class ipserverThread(threading.Thread):
                                         self.ready = True
                             if self.proto == 'icmp':
                                 icmp_hdr = data[20:28]
-                                type, code, chksum, id, seq = struct.unpack('bbHHh', icmp_hdr)
+                                typ, code, chksum, id, seq = struct.unpack('bbHHh', icmp_hdr)
                                 if self.server:
                                     self.lastid = id
                                 data = data[28:]
@@ -412,12 +425,12 @@ class ipserverThread(threading.Thread):
                                         label, = struct.unpack('!%ds' % qlen, data[1:qlen+1])
                                         labels.append(label)
                                         data = data[qlen+1:]
-                                    type, cls = struct.unpack('!HH',data[1:5])
+                                    typ, cls = struct.unpack('!HH',data[1:5])
                                     data = data[5:]
                                     del labels[-2:]
                                 self.lastq = questions
                                 for i in range(acount):
-                                    name, type, cls, ttl, dlen, tlen = struct.unpack('!HHHIHB', data[:13])
+                                    name, typ, cls, ttl, dlen, tlen = struct.unpack('!HHHIHB', data[:13])
                                     data = data[13:]
                                 #sometimes DNS resends stuff and asks for extra stuff, check times to make sure it isn't a repeat
                                 millis = int(labels[0].replace('-','=').decode('base64'))
@@ -456,6 +469,7 @@ class ipserverThread(threading.Thread):
                                     elif flag == SACK and self.state == WAIT_ACK and seq == self.lseq and data == '' and not self.ready:
                                         self.state = IDLE
                                         self.ready = True
+                                        self.lastsleep = int(round(time.time() * 1000))
                                         self.remoteid = sid
                                         self.send('', ACK, 0, 8)
                                         sys.stderr.write('[*] Connection to ' + self.remote[0] + ' established.\n')
@@ -471,6 +485,7 @@ class ipserverThread(threading.Thread):
                                                         self.state = IDLE
                                                         if not self.ready:
                                                             self.ready = True
+                                                            self.lastsleep = int(round(time.time() * 1000))
                                             elif seq < self.lseq:
                                                 data = ''
                                                 sys.stderr.write('[!] OUT OF SYNC!: ' + str(seq) + ' lseq: ' + str(self.lseq) +'\n')
@@ -544,9 +559,10 @@ class ipserverThread(threading.Thread):
                             break
                         else:
                             if data != '':
+                                self.lastsleep = int(round(time.time() * 1000))
                                 self.oq.put(data)
 
-                        inp, outp, excpt = select.select(self.input,[],[],0)
+                        inp, outp, excpt = select.select([self.input],[],[],0)
             time.sleep(0.01)
         sys.stderr.write('[!] DEAD\n')
         if self.c:
@@ -559,14 +575,9 @@ class ipserverThread(threading.Thread):
             self.ready = True
         if not self.openSocket():
             self.error = True
-        else:
-            self.input = [self.s]
-            self.c = self.s
-            self.recvthread.start()
-
         while self.running or (self.stateful and not self.done and not self.error):
             if not self.error:
-                if self.stateful and (self.proto == 'icmp' or self.proto == 'udp' or self.proto == 'dns'):
+                if self.stateful:# and (self.proto == 'icmp' or self.proto == 'udp' or self.proto == 'dns'):
                     if not self.ready and self.running:
                         if not self.server:
                             if self.state == None:
@@ -594,26 +605,33 @@ class ipserverThread(threading.Thread):
                                 else:
                                     self.error = True
                             
-                        if self.ready and not self.iqlocked and not self.iq.empty():
-                            msg = ''
-                            self.busy = True
-                            while not self.iq.empty():
-                                msg += self.iq.get()
-                            if msg != '':
-                                self.send(msg)
-                            self.busy = False   
-
-                # non-stateful, just send the messages and hope for the best
-                else:
-                    if self.ready and not self.iqlocked and not self.iq.empty():
-                        self.busy = True
-                        msg = ''
-                        while not self.iq.empty():
-                            msg += self.iq.get()
-                        if msg != '':
-                            self.send(msg)
-                        self.busy = False
-
+                # non-stateful or tcp, just send the messages and hope for the best
+                if self.ready and not self.iqlocked and not self.iq.empty():
+                    msg = ''
+                    self.busy = True
+                    while not self.iq.empty():
+                        msg += self.iq.get()
+                    if msg != '':
+                        self.send(msg)
+                    self.busy = False
+                    self.lastsleep = int(round(time.time() * 1000))
+                if not self.server and self.sleep and self.ready and not self.sleeping and int(round(time.time() * 1000)) - self.lastsleep > self.sleep:
+                    self.ready = False
+                    if self.proto in ['udp', 'icmp', 'dns']:
+                        self.send('', FIN)
+                        self.ready = False
+                        self.reset()
+                    if self.proto in ['tcp', 'http']:
+                        self.input = None
+                        self.c.close()
+                    self.sleeping = True
+                    self.lastsleep = int(round(time.time() * 1000))
+                    print 'GO TO SLEEP'
+                elif not self.server and self.sleeping and int(round(time.time() * 1000)) - self.lastsleep > self.sleep:
+                    print 'WAKE UP!'
+                    self.sleeping = False
+                    if self.proto in ['tcp', 'http']:
+                        self.openSocket()
             time.sleep(0.05)
 
         self.recvthread.running = False
@@ -722,13 +740,14 @@ usage:
 arguments:
   -h   show this help message and exit
 
-  url  data source url in format proto://localip:port[:destip]
+  url  data source url in format proto://localip:port[:destip],opts
        
        e.g. tcp://127.0.0.1:8080 for a listener on the lo using tcp on port 8080
        e.g. icmp://0.0.0.0:0:192.168.1.1 for a client on all ints using icmp to 192.168.1.1
 
-data source options:
-  r   "reliable" connection (only applies to UDP, ICMP, DNS, and NTP connections)
+data source options, comma separated:
+
+  r    "reliable" connection (only applies to UDP, ICMP, DNS, and NTP connections)
        requires other endpoints to be wildcat listeners
        e.g tcp://:8080:192.168.1.2,r
 
@@ -742,14 +761,18 @@ data source options:
   p    enable automatic restarting of listners when a client disconnects
        note: does not apply to stdin endpoints
 
-  s    sleep-time
+  d=   dns name to use for dns chanel, must be a string
 
-  j    jitter
+  s=   sleep-time, in seconds
+       only applies to stateful connections, and must be specified on both ends to prevent
+       timeouts
+
+  j=   jitter
 
   v    verbose output
 
   multiple options can be applied to each url
-  e.g. icmp://:8080:192.168.1.2,rcb
+  e.g. icmp://:8080:192.168.1.2,r,c,b,s=1000
 
   d= DNS server name to use in DNS relay connection
 
@@ -766,20 +789,27 @@ def main():
     args = p.parse_args()
 
     for i in args.url:
-        argsplit = i.split(',')
+        argsplit = re.split(',|=', i)
         url = argsplit[0]
-        opts = {'reliable': False, 'compression': False, 'bidirectional': False, 'dns': '', 'verbose': False, 'persistent': False}
+        opts = {'reliable': False, 'compression': False, 'bidirectional': False, 'dns': '', 'verbose': False, 'persistent': False, 'sleep': None}
         if len(argsplit) > 1:
-            if 'c' in argsplit[1]:
+            if 'c' in argsplit:
                 opts['compression'] = True
-            if 'r' in argsplit[1]:
+            if 'r' in argsplit:
                 opts['reliable'] = True
-            if 'b' in argsplit[1]:
+            if 'b' in argsplit:
                 opts['bidirectional'] = True
-            if 'v' in argsplit[1]:
+            if 'v' in argsplit:
                 opts['verbose'] = True
-            if 'p' in argsplit[1]:
+            if 'p' in argsplit:
                 opts['persistent'] = True
+            if 's' in argsplit:
+                try:
+                    s = int(argsplit[argsplit.index('s') + 1])
+                    if s > 0:
+                        opts['sleep'] = s
+                except:
+                    pass
         if url == 'std':
             sys.stderr.write('[*] Starting stdin.\n')
             t = stdThread(opts)
@@ -847,8 +877,8 @@ def main():
                         while not t.oq.empty():
                             msg += t.oq.get()
                             name = t.name
-                        #if t.compress:
-                        #    msg = zlib.decompress(msg)
+                        if t.compress:
+                            msg = zlib.decompress(msg)
                         if msg != '':
                             for t2 in threads:
                                 if t2.name != name:
